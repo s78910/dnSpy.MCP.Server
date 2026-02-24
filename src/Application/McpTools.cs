@@ -43,6 +43,9 @@ namespace dnSpy.MCP.Server.Application
         readonly Lazy<AssemblyTools> assemblyTools;
         readonly Lazy<TypeTools> typeTools;
         readonly Lazy<UsageFindingCommandTools> usageFindingCommandTools;
+        readonly Lazy<EditTools> editTools;
+        readonly Lazy<DebugTools> debugTools;
+        readonly Lazy<DumpTools> dumpTools;
 
         [ImportingConstructor]
         public McpTools(
@@ -50,13 +53,19 @@ namespace dnSpy.MCP.Server.Application
             IDecompilerService decompilerService,
             Lazy<AssemblyTools> assemblyTools,
             Lazy<TypeTools> typeTools,
-            Lazy<UsageFindingCommandTools> usageFindingCommandTools)
+            Lazy<UsageFindingCommandTools> usageFindingCommandTools,
+            Lazy<EditTools> editTools,
+            Lazy<DebugTools> debugTools,
+            Lazy<DumpTools> dumpTools)
         {
             this.documentTreeView = documentTreeView;
             this.decompilerService = decompilerService;
             this.assemblyTools = assemblyTools;
             this.typeTools = typeTools;
             this.usageFindingCommandTools = usageFindingCommandTools;
+            this.editTools = editTools;
+            this.debugTools = debugTools;
+            this.dumpTools = dumpTools;
         }
 
         public List<ToolInfo> GetAvailableTools()
@@ -91,7 +100,7 @@ namespace dnSpy.MCP.Server.Application
                 },
                 new ToolInfo {
                     Name = "list_types",
-                    Description = "List all types in an assembly or namespace",
+                    Description = "List types in an assembly or namespace. Supports glob (System.* or *Controller) and regex (^System\\..*Controller$) via name_pattern.",
                     InputSchema = new Dictionary<string, object> {
                         ["type"] = "object",
                         ["properties"] = new Dictionary<string, object> {
@@ -101,11 +110,15 @@ namespace dnSpy.MCP.Server.Application
                             },
                             ["namespace"] = new Dictionary<string, object> {
                                 ["type"] = "string",
-                                ["description"] = "Optional namespace filter"
+                                ["description"] = "Optional exact namespace filter"
+                            },
+                            ["name_pattern"] = new Dictionary<string, object> {
+                                ["type"] = "string",
+                                ["description"] = "Optional name filter: glob (* and ?) or regex (use ^/$). Matches against type short name and full name."
                             },
                             ["cursor"] = new Dictionary<string, object> {
                                 ["type"] = "string",
-                                ["description"] = "Optional cursor for pagination"
+                                ["description"] = "Pagination cursor from previous response nextCursor"
                             }
                         },
                         ["required"] = new List<string> { "assembly_name" }
@@ -157,17 +170,17 @@ namespace dnSpy.MCP.Server.Application
                 },
                 new ToolInfo {
                     Name = "search_types",
-                    Description = "Search for types by name across all loaded assemblies",
+                    Description = "Search for types by name across all loaded assemblies. Supports glob wildcards (*IService*) and regex (^My\\..*Repository$).",
                     InputSchema = new Dictionary<string, object> {
                         ["type"] = "object",
                         ["properties"] = new Dictionary<string, object> {
                             ["query"] = new Dictionary<string, object> {
                                 ["type"] = "string",
-                                ["description"] = "Search query (supports wildcards)"
+                                ["description"] = "Search query: plain substring, glob (* and ?), or regex (use ^/$). Matched against FullName."
                             },
                             ["cursor"] = new Dictionary<string, object> {
                                 ["type"] = "string",
-                                ["description"] = "Optional cursor for pagination"
+                                ["description"] = "Pagination cursor from previous response nextCursor"
                             }
                         },
                         ["required"] = new List<string> { "query" }
@@ -175,7 +188,7 @@ namespace dnSpy.MCP.Server.Application
                 },
                 new ToolInfo {
                     Name = "list_methods_in_type",
-                    Description = "List all methods in a type",
+                    Description = "List methods in a type. Filter by visibility and/or name pattern (glob or regex).",
                     InputSchema = new Dictionary<string, object> {
                         ["type"] = "object",
                         ["properties"] = new Dictionary<string, object> {
@@ -189,7 +202,15 @@ namespace dnSpy.MCP.Server.Application
                             },
                             ["visibility"] = new Dictionary<string, object> {
                                 ["type"] = "string",
-                                ["description"] = "Filter by visibility (public, private, protected, internal)"
+                                ["description"] = "Optional visibility filter: public, private, protected, or internal"
+                            },
+                            ["name_pattern"] = new Dictionary<string, object> {
+                                ["type"] = "string",
+                                ["description"] = "Optional name filter: glob (* and ?) or regex (use ^/$). E.g. 'Get*', '^On[A-Z]', 'Async$'"
+                            },
+                            ["cursor"] = new Dictionary<string, object> {
+                                ["type"] = "string",
+                                ["description"] = "Pagination cursor from previous response nextCursor"
                             }
                         },
                         ["required"] = new List<string> { "assembly_name", "type_full_name" }
@@ -348,6 +369,287 @@ namespace dnSpy.MCP.Server.Application
                         },
                         ["required"] = new List<string> { "assembly_name", "type_full_name", "method_name" }
                     }
+                },
+
+                // ── Edit Tools ──────────────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "decompile_type",
+                    Description = "Decompile an entire type (class/struct/interface/enum) to C# source code",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type (e.g. MyNamespace.MyClass)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "change_member_visibility",
+                    Description = "Change the visibility/access modifier of a type or its members (method, field, property, event). Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the containing type (or the type itself when member_kind=type)" },
+                            ["member_kind"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Kind of member: type, method, field, property, or event" },
+                            ["member_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the member (ignored when member_kind=type)" },
+                            ["new_visibility"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "New visibility: public, private, protected, internal, protected_internal, private_protected" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "member_kind", "new_visibility" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "rename_member",
+                    Description = "Rename a type or one of its members (method, field, property, event). Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type" },
+                            ["member_kind"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Kind of member: type, method, field, property, or event" },
+                            ["old_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Current name of the member" },
+                            ["new_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "New name for the member" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "member_kind", "old_name", "new_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "save_assembly",
+                    Description = "Save a (possibly modified) assembly to disk. Persists all in-memory changes made by rename_member, change_member_visibility, etc.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly to save" },
+                            ["output_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Output file path. Defaults to the original file location." }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "list_events_in_type",
+                    Description = "List all events defined in a type",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "get_custom_attributes",
+                    Description = "Get custom attributes on a type or one of its members. Omit member_name to get the type's own attributes.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type" },
+                            ["member_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the member (optional; omit for type-level attributes)" },
+                            ["member_kind"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Kind of member: method, field, property, or event (optional; helps disambiguation)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "list_nested_types",
+                    Description = "List all nested types inside a type, recursively",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the containing type" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name" }
+                    }
+                },
+
+                // ── Debug Tools ─────────────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "get_debugger_state",
+                    Description = "Get the current debugger state: whether debugging is active, running or paused, and process information",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "list_breakpoints",
+                    Description = "List all code breakpoints currently registered in dnSpy",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "set_breakpoint",
+                    Description = "Set a breakpoint at a method entry point (or specific IL offset). The breakpoint persists across debug sessions.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type" },
+                            ["method_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the method" },
+                            ["il_offset"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "IL offset within the method body (default 0 = method entry)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "method_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "remove_breakpoint",
+                    Description = "Remove a breakpoint from a specific method and IL offset",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type" },
+                            ["method_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the method" },
+                            ["il_offset"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "IL offset of the breakpoint (default 0)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "method_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "clear_all_breakpoints",
+                    Description = "Remove all visible breakpoints",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "continue_debugger",
+                    Description = "Resume execution of all paused debugged processes",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "break_debugger",
+                    Description = "Pause all currently running debugged processes",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "stop_debugging",
+                    Description = "Stop all active debug sessions",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "get_call_stack",
+                    Description = "Get the call stack of the current thread when the debugger is paused. Use break_debugger to pause first.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+
+                // ── Previously-hidden TypeTools ──────────────────────────────────
+                new ToolInfo {
+                    Name = "get_type_fields",
+                    Description = "List fields in a type matching a glob/regex pattern. Supports * and ? wildcards.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type" },
+                            ["pattern"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Field name pattern: glob (* ?) or regex (^/$). Use * to list all." },
+                            ["cursor"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Pagination cursor" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "pattern" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "get_type_property",
+                    Description = "Get detailed information about a single property, including getter/setter info and custom attributes.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type" },
+                            ["property_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the property" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "property_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "find_path_to_type",
+                    Description = "Find property/field reference paths from one type to another via BFS traversal of the object graph.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["from_type"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the starting type" },
+                            ["to_type"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name (or substring) of the target type" },
+                            ["max_depth"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Maximum BFS depth (default 5)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "from_type", "to_type" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "list_native_modules",
+                    Description = "List all native DLLs imported via P/Invoke (DllImport) in an assembly, grouped by DLL name.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+
+                // ── Memory Dump Tools ────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "list_runtime_modules",
+                    Description = "List all .NET modules loaded in the currently debugged processes. Requires an active debug session.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Optional: filter by process ID" },
+                            ["name_filter"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Optional: filter by module name (glob or regex)" }
+                        },
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "dump_module_from_memory",
+                    Description = "Dump a loaded .NET module from process memory to a file. Uses IDbgDotNetRuntime for .NET modules (best quality), falling back to raw ReadMemory. Requires paused or active debug session.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["module_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Module name, filename, or basename (e.g. MyApp.dll)" },
+                            ["output_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Absolute path to write the dumped module (e.g. C:\\dump\\MyApp_dumped.dll)" },
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Optional: target process ID when multiple processes are debugged" }
+                        },
+                        ["required"] = new List<string> { "module_name", "output_path" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "read_process_memory",
+                    Description = "Read raw bytes from a debugged process address and return a formatted hex dump. Requires active debug session.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["address"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Memory address as hex string (0x7FF000) or decimal" },
+                            ["size"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Number of bytes to read (1-65536)" },
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Optional: target process ID" }
+                        },
+                        ["required"] = new List<string> { "address", "size" }
+                    }
                 }
             };
         }
@@ -375,6 +677,38 @@ namespace dnSpy.MCP.Server.Application
                     "get_method_il" => InvokeLazy(typeTools, "GetMethodIL", arguments),
                     "get_method_il_bytes" => InvokeLazy(typeTools, "GetMethodILBytes", arguments),
                     "get_method_exception_handlers" => InvokeLazy(typeTools, "GetMethodExceptionHandlers", arguments),
+
+                    // Edit tools
+                    "decompile_type" => InvokeLazy(editTools, "DecompileType", arguments),
+                    "change_member_visibility" => InvokeLazy(editTools, "ChangeVisibility", arguments),
+                    "rename_member" => InvokeLazy(editTools, "RenameMember", arguments),
+                    "save_assembly" => InvokeLazy(editTools, "SaveAssembly", arguments),
+                    "list_events_in_type" => InvokeLazy(editTools, "ListEventsInType", arguments),
+                    "get_custom_attributes" => InvokeLazy(editTools, "GetCustomAttributes", arguments),
+                    "list_nested_types" => InvokeLazy(editTools, "ListNestedTypes", arguments),
+
+                    // Previously-hidden TypeTools
+                    "get_type_fields" => InvokeLazy(typeTools, "GetTypeFields", arguments),
+                    "get_type_property" => InvokeLazy(typeTools, "GetTypeProperty", arguments),
+                    "find_path_to_type" => InvokeLazy(typeTools, "FindPathToType", arguments),
+                    "list_native_modules" => InvokeLazy(assemblyTools, "ListNativeModules", arguments),
+
+                    // Memory dump tools
+                    "list_runtime_modules" => InvokeLazy(dumpTools, "ListRuntimeModules", arguments),
+                    "dump_module_from_memory" => InvokeLazy(dumpTools, "DumpModuleFromMemory", arguments),
+                    "read_process_memory" => InvokeLazy(dumpTools, "ReadProcessMemory", arguments),
+
+                    // Debug tools
+                    "get_debugger_state" => InvokeLazy(debugTools, "GetDebuggerState", arguments),
+                    "list_breakpoints" => InvokeLazy(debugTools, "ListBreakpoints", arguments),
+                    "set_breakpoint" => InvokeLazy(debugTools, "SetBreakpoint", arguments),
+                    "remove_breakpoint" => InvokeLazy(debugTools, "RemoveBreakpoint", arguments),
+                    "clear_all_breakpoints" => InvokeLazy(debugTools, "ClearAllBreakpoints", arguments),
+                    "continue_debugger" => InvokeLazy(debugTools, "ContinueDebugger", arguments),
+                    "break_debugger" => InvokeLazy(debugTools, "BreakDebugger", arguments),
+                    "stop_debugging" => InvokeLazy(debugTools, "StopDebugging", arguments),
+                    "get_call_stack" => InvokeLazy(debugTools, "GetCallStack", arguments),
+
                     _ => new CallToolResult
                     {
                         Content = new List<ToolContent> {
@@ -618,7 +952,7 @@ namespace dnSpy.MCP.Server.Application
         static (int offset, int pageSize) DecodeCursor(string? cursor)
         {
             if (string.IsNullOrEmpty(cursor))
-                return (0, 10);
+                return (0, 50);
 
             try
             {

@@ -127,15 +127,30 @@ namespace dnSpy.MCP.Server.Application
             if (arguments.TryGetValue("namespace", out var nsObj))
                 namespaceFilter = nsObj.ToString();
 
+            string? namePattern = null;
+            if (arguments.TryGetValue("name_pattern", out var npObj))
+                namePattern = npObj?.ToString();
+
             string? cursor = null;
             if (arguments.TryGetValue("cursor", out var cursorObj))
                 cursor = cursorObj.ToString();
 
             var (offset, pageSize) = DecodeCursor(cursor);
 
+            System.Text.RegularExpressions.Regex? nameRegex = null;
+            if (!string.IsNullOrEmpty(namePattern))
+                nameRegex = BuildPatternRegex(namePattern!);
+
             var types = assembly.Modules
                 .SelectMany(m => m.Types)
-                .Where(t => string.IsNullOrEmpty(namespaceFilter) || t.Namespace == namespaceFilter)
+                .Where(t => {
+                    if (!string.IsNullOrEmpty(namespaceFilter) &&
+                        !t.Namespace.String.Equals(namespaceFilter, StringComparison.OrdinalIgnoreCase))
+                        return false;
+                    if (nameRegex != null)
+                        return nameRegex.IsMatch(t.Name.String) || nameRegex.IsMatch(t.FullName);
+                    return true;
+                })
                 .Select(t => new
                 {
                     FullName = t.FullName,
@@ -222,9 +237,23 @@ namespace dnSpy.MCP.Server.Application
             return Convert.ToBase64String(bytes);
         }
 
+        static System.Text.RegularExpressions.Regex BuildPatternRegex(string pattern)
+        {
+            bool isRegex = pattern.IndexOfAny(new[] { '^', '$', '[', '(', '|', '+', '{' }) >= 0;
+            if (isRegex)
+                return new System.Text.RegularExpressions.Regex(pattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+                    System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+            var escaped = System.Text.RegularExpressions.Regex.Escape(pattern)
+                .Replace(@"\*", ".*").Replace(@"\?", ".");
+            return new System.Text.RegularExpressions.Regex("^" + escaped + "$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+                System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        }
+
         (int offset, int pageSize) DecodeCursor(string? cursor)
         {
-            const int defaultPageSize = 10;
+            const int defaultPageSize = 50;
             if (string.IsNullOrEmpty(cursor))
                 return (0, defaultPageSize);
 
