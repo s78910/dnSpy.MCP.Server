@@ -18,6 +18,7 @@ namespace dnSpy.MCP.Server.Application
     {
         private readonly IDocumentTreeView documentTreeView;
 
+        [ImportingConstructor]
         public UsageFindingCommandTools(IDocumentTreeView documentTreeView)
         {
             this.documentTreeView = documentTreeView ?? throw new ArgumentNullException(nameof(documentTreeView));

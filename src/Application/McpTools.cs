@@ -42,10 +42,10 @@ namespace dnSpy.MCP.Server.Application
         readonly IDecompilerService decompilerService;
         readonly Lazy<AssemblyTools> assemblyTools;
         readonly Lazy<TypeTools> typeTools;
-        readonly Lazy<UsageFindingCommandTools> usageFindingCommandTools;
         readonly Lazy<EditTools> editTools;
         readonly Lazy<DebugTools> debugTools;
         readonly Lazy<DumpTools> dumpTools;
+        readonly Lazy<MemoryInspectTools> memoryInspectTools;
 
         [ImportingConstructor]
         public McpTools(
@@ -53,19 +53,19 @@ namespace dnSpy.MCP.Server.Application
             IDecompilerService decompilerService,
             Lazy<AssemblyTools> assemblyTools,
             Lazy<TypeTools> typeTools,
-            Lazy<UsageFindingCommandTools> usageFindingCommandTools,
             Lazy<EditTools> editTools,
             Lazy<DebugTools> debugTools,
-            Lazy<DumpTools> dumpTools)
+            Lazy<DumpTools> dumpTools,
+            Lazy<MemoryInspectTools> memoryInspectTools)
         {
             this.documentTreeView = documentTreeView;
             this.decompilerService = decompilerService;
             this.assemblyTools = assemblyTools;
             this.typeTools = typeTools;
-            this.usageFindingCommandTools = usageFindingCommandTools;
             this.editTools = editTools;
             this.debugTools = debugTools;
             this.dumpTools = dumpTools;
+            this.memoryInspectTools = memoryInspectTools;
         }
 
         public List<ToolInfo> GetAvailableTools()
@@ -416,7 +416,7 @@ namespace dnSpy.MCP.Server.Application
                 },
                 new ToolInfo {
                     Name = "save_assembly",
-                    Description = "Save a (possibly modified) assembly to disk. Persists all in-memory changes made by rename_member, change_member_visibility, etc.",
+                    Description = "Save a (possibly modified) assembly to disk. Persists all in-memory changes made by rename_member, change_member_visibility, edit_assembly_metadata, etc.",
                     InputSchema = new Dictionary<string, object> {
                         ["type"] = "object",
                         ["properties"] = new Dictionary<string, object> {
@@ -426,6 +426,95 @@ namespace dnSpy.MCP.Server.Application
                         ["required"] = new List<string> { "assembly_name" }
                     }
                 },
+
+                // ── Assembly metadata & flags ──────────────────────────────────────────
+                new ToolInfo {
+                    Name = "get_assembly_metadata",
+                    Description = "Read assembly-level metadata: name, version, culture, public key, flags, hash algorithm, module count, and custom attributes.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "edit_assembly_metadata",
+                    Description = "Edit assembly-level metadata fields: name, version, culture, or hash algorithm. Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]   = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly to edit" },
+                            ["new_name"]        = new Dictionary<string, object> { ["type"] = "string", ["description"] = "New assembly name (optional)" },
+                            ["version"]         = new Dictionary<string, object> { ["type"] = "string", ["description"] = "New version as major.minor.build.revision (optional, e.g. '2.0.0.0')" },
+                            ["culture"]         = new Dictionary<string, object> { ["type"] = "string", ["description"] = "New culture string, e.g. '' (neutral), 'en-US' (optional)" },
+                            ["hash_algorithm"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Hash algorithm: SHA1, MD5, or None (optional)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "set_assembly_flags",
+                    Description = "Set or clear an individual assembly attribute flag. Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["flag_name"]     = new Dictionary<string, object> {
+                                ["type"] = "string",
+                                ["description"] = "Flag to change: PublicKey | Retargetable | DisableJITOptimizer | EnableJITTracking | WindowsRuntime | ProcessorArchitecture"
+                            },
+                            ["value"] = new Dictionary<string, object> {
+                                ["type"] = "string",
+                                ["description"] = "true/false for boolean flags; architecture name for ProcessorArchitecture (AnyCPU | x86 | AMD64 | ARM | ARM64 | IA64)"
+                            }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "flag_name", "value" }
+                    }
+                },
+
+                // ── Assembly references / DLL injection ────────────────────────────────
+                new ToolInfo {
+                    Name = "list_assembly_references",
+                    Description = "List all assembly references (AssemblyRef table entries) in the manifest module.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "add_assembly_reference",
+                    Description = "Add an assembly reference (AssemblyRef) by loading a DLL from disk. A TypeForwarder is created to anchor the reference so it persists when saved. Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the target assembly to add the reference to" },
+                            ["dll_path"]      = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Absolute path to the DLL to reference" },
+                            ["type_name"]     = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Specific public type to use as the TypeForwarder anchor (optional; defaults to first public type)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "dll_path" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "inject_type_from_dll",
+                    Description = "Deep-clone a type (fields, methods with IL, properties, events) from an external DLL file into the target assembly. Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]    = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the target assembly" },
+                            ["dll_path"]         = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Absolute path to the source DLL" },
+                            ["source_type"]      = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name (or simple name) of the type to inject" },
+                            ["target_namespace"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Namespace for the injected type in the target assembly (optional; defaults to source namespace)" },
+                            ["overwrite"]        = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Replace existing type with same name/namespace if present (default false)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "dll_path", "source_type" }
+                    }
+                },
+
                 new ToolInfo {
                     Name = "list_events_in_type",
                     Description = "List all events defined in a type",
@@ -650,6 +739,74 @@ namespace dnSpy.MCP.Server.Application
                         },
                         ["required"] = new List<string> { "address", "size" }
                     }
+                },
+
+                // ── Memory Inspect / Runtime Variable Tools ─────────────────────────
+                new ToolInfo {
+                    Name = "get_local_variables",
+                    Description = "Read local variables and parameters from a paused debug session stack frame. Returns primitive values, strings, and addresses for complex objects. Requires the debugger to be paused at a breakpoint.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["frame_index"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Stack frame index (0 = innermost/current frame, default 0)" },
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Optional: target process ID when multiple processes are being debugged" }
+                        },
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "get_pe_sections",
+                    Description = "List PE sections (headers) of a module loaded in the debugged process memory. Returns section names, virtual addresses, sizes, and characteristics. Requires active debug session.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["module_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Module name, filename, or basename (e.g. MyApp.dll)" },
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Optional: target process ID" }
+                        },
+                        ["required"] = new List<string> { "module_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "dump_pe_section",
+                    Description = "Extract a specific PE section (e.g. .text, .data, .rsrc) from a module in process memory. Writes to file and/or returns base64-encoded bytes. Requires active debug session.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["module_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Module name, filename, or basename (e.g. MyApp.dll)" },
+                            ["section_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "PE section name, e.g. .text, .data, .rsrc, .rdata" },
+                            ["output_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Optional: absolute path to write the section bytes to disk" },
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Optional: target process ID" }
+                        },
+                        ["required"] = new List<string> { "module_name", "section_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "dump_module_unpacked",
+                    Description = "Dump a full module from process memory with memory-to-file layout conversion. Produces a valid PE file suitable for loading in dnSpy/IDA. Handles .NET, native, and mixed-mode modules. Requires active debug session.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["module_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Module name, filename, or basename (e.g. MyApp.dll)" },
+                            ["output_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Absolute path to write the dumped PE file" },
+                            ["try_fix_pe_layout"] = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Convert memory layout to file layout (section VA→PointerToRawData remapping). Default true." },
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Optional: target process ID" }
+                        },
+                        ["required"] = new List<string> { "module_name", "output_path" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "dump_memory_to_file",
+                    Description = "Save a contiguous range of process memory directly to a file. Supports large ranges up to 256 MB. Useful for dumping unpacked payloads or large data buffers. Requires active debug session.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["address"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Start address as hex (0x7FF000) or decimal" },
+                            ["size"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Number of bytes to dump (1 to 268435456 / 256 MB)" },
+                            ["output_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Absolute path to write the memory dump" },
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Optional: target process ID" }
+                        },
+                        ["required"] = new List<string> { "address", "size", "output_path" }
+                    }
                 }
             };
         }
@@ -683,6 +840,12 @@ namespace dnSpy.MCP.Server.Application
                     "change_member_visibility" => InvokeLazy(editTools, "ChangeVisibility", arguments),
                     "rename_member" => InvokeLazy(editTools, "RenameMember", arguments),
                     "save_assembly" => InvokeLazy(editTools, "SaveAssembly", arguments),
+                    "get_assembly_metadata" => InvokeLazy(editTools, "GetAssemblyMetadata", arguments),
+                    "edit_assembly_metadata" => InvokeLazy(editTools, "EditAssemblyMetadata", arguments),
+                    "set_assembly_flags" => InvokeLazy(editTools, "SetAssemblyFlags", arguments),
+                    "list_assembly_references" => InvokeLazy(editTools, "ListAssemblyReferences", arguments),
+                    "add_assembly_reference" => InvokeLazy(editTools, "AddAssemblyReference", arguments),
+                    "inject_type_from_dll" => InvokeLazy(editTools, "InjectTypeFromDll", arguments),
                     "list_events_in_type" => InvokeLazy(editTools, "ListEventsInType", arguments),
                     "get_custom_attributes" => InvokeLazy(editTools, "GetCustomAttributes", arguments),
                     "list_nested_types" => InvokeLazy(editTools, "ListNestedTypes", arguments),
@@ -697,6 +860,13 @@ namespace dnSpy.MCP.Server.Application
                     "list_runtime_modules" => InvokeLazy(dumpTools, "ListRuntimeModules", arguments),
                     "dump_module_from_memory" => InvokeLazy(dumpTools, "DumpModuleFromMemory", arguments),
                     "read_process_memory" => InvokeLazy(dumpTools, "ReadProcessMemory", arguments),
+                    "get_pe_sections" => InvokeLazy(dumpTools, "GetPeSections", arguments),
+                    "dump_pe_section" => InvokeLazy(dumpTools, "DumpPeSection", arguments),
+                    "dump_module_unpacked" => InvokeLazy(dumpTools, "DumpModuleUnpacked", arguments),
+                    "dump_memory_to_file" => InvokeLazy(dumpTools, "DumpMemoryToFile", arguments),
+
+                    // Memory inspect / runtime variable tools
+                    "get_local_variables" => InvokeLazy(memoryInspectTools, "GetLocalVariables", arguments),
 
                     // Debug tools
                     "get_debugger_state" => InvokeLazy(debugTools, "GetDebuggerState", arguments),
@@ -790,14 +960,8 @@ namespace dnSpy.MCP.Server.Application
                 if (parameters.Length == 0) {
                     invokeArgs = Array.Empty<object?>();
                 }
-                else if (arguments == null || arguments.Count == 0) {
-                    return new CallToolResult
-                    {
-                        Content = new List<ToolContent> { new ToolContent { Text = $"Method {methodName} requires arguments but none were provided" } },
-                        IsError = true
-                    };
-                }
                 else {
+                    // Pass arguments (null or empty dict) — the callee validates required params itself
                     invokeArgs = new object?[] { arguments };
                 }
 
@@ -810,10 +974,11 @@ namespace dnSpy.MCP.Server.Application
             }
             catch (TargetInvocationException tie)
             {
-                McpLogger.Exception(tie, $"InvokeLazy target invocation failed for {methodName}");
+                var inner = tie.InnerException ?? tie;
+                McpLogger.Exception(inner, $"InvokeLazy error in {methodName}");
                 return new CallToolResult
                 {
-                    Content = new List<ToolContent> { new ToolContent { Text = $"InvokeLazy invocation error: {tie.InnerException?.Message ?? tie.Message}" } },
+                    Content = new List<ToolContent> { new ToolContent { Text = $"InvokeLazy invocation error: {inner.Message}" } },
                     IsError = true
                 };
             }
@@ -905,7 +1070,62 @@ namespace dnSpy.MCP.Server.Application
             if (targetMethod == null)
                 throw new ArgumentException($"Method not found: {methodNameObj}");
 
-            return usageFindingCommandTools.Value.FindWhoCallsMethod(targetMethod);
+            // Collect assembly references on the UI thread (documentTreeView is WPF-bound)
+            var targetFullName = targetMethod.FullName;
+            var assemblies = System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                documentTreeView.GetAllModuleNodes()
+                    .Select(m => m.Document?.AssemblyDef)
+                    .Where(a => a != null)
+                    .ToList());
+
+            // IL scan runs on the background thread — dnlib objects are not WPF-bound
+            var callers = assemblies
+                .SelectMany(a => a!.Modules)
+                .SelectMany(mod => GetAllTypesRecursive(mod))
+                .SelectMany(t => t.Methods)
+                .Where(m => m.Body?.Instructions != null)
+                .SelectMany(m => m.Body.Instructions
+                    .Where(instr =>
+                        (instr.OpCode.Code == dnlib.DotNet.Emit.Code.Call ||
+                         instr.OpCode.Code == dnlib.DotNet.Emit.Code.Callvirt) &&
+                        instr.Operand is MethodDef calledDef && calledDef.FullName == targetFullName)
+                    .Select(_ => new {
+                        MethodName = m.Name.String,
+                        DeclaringType = m.DeclaringType?.FullName ?? "Unknown",
+                        AssemblyName = m.DeclaringType?.Module?.Assembly?.Name.String ?? "Unknown"
+                    }))
+                .OrderBy(c => c.AssemblyName).ThenBy(c => c.DeclaringType).ThenBy(c => c.MethodName)
+                .ToList();
+
+            var resultJson = System.Text.Json.JsonSerializer.Serialize(new {
+                TargetMethod = targetFullName,
+                CallerCount = callers.Count,
+                Callers = callers
+            }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+
+            return new CallToolResult {
+                Content = new List<ToolContent> { new ToolContent { Text = resultJson } }
+            };
+        }
+
+        IEnumerable<TypeDef> GetAllTypesRecursive(ModuleDef module)
+        {
+            foreach (var type in module.Types)
+            {
+                yield return type;
+                foreach (var nested in GetAllNestedTypesRecursive(type))
+                    yield return nested;
+            }
+        }
+
+        IEnumerable<TypeDef> GetAllNestedTypesRecursive(TypeDef type)
+        {
+            foreach (var nested in type.NestedTypes)
+            {
+                yield return nested;
+                foreach (var deep in GetAllNestedTypesRecursive(nested))
+                    yield return deep;
+            }
         }
 
         CallToolResult AnalyzeTypeInheritance(Dictionary<string, object>? arguments)

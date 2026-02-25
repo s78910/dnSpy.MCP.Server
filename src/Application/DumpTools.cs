@@ -297,6 +297,341 @@ namespace dnSpy.MCP.Server.Application {
 			};
 		}
 
+		// ── get_pe_sections ──────────────────────────────────────────────────────
+
+		/// <summary>
+		/// Lists the PE sections of a module loaded in the debugged process.
+		/// Arguments: module_name (required), process_id (int, optional)
+		/// </summary>
+		public CallToolResult GetPeSections(Dictionary<string, object>? arguments) {
+			if (arguments == null || !arguments.TryGetValue("module_name", out var moduleNameObj))
+				throw new ArgumentException("module_name is required");
+
+			var moduleName = moduleNameObj.ToString() ?? string.Empty;
+			int? filterPid = null;
+			if (arguments.TryGetValue("process_id", out var pidObj) && pidObj is JsonElement pidElem && pidElem.TryGetInt32(out var pidInt))
+				filterPid = pidInt;
+
+			var mgr = dbgManager.Value;
+			if (!mgr.IsDebugging)
+				throw new InvalidOperationException("Debugger is not active.");
+
+			var (targetModule, _) = FindModule(mgr, moduleName, filterPid);
+			if (targetModule == null)
+				throw new ArgumentException($"Module '{moduleName}' not found. Use list_runtime_modules.");
+
+			if (!targetModule.HasAddress)
+				throw new InvalidOperationException($"Module '{moduleName}' has no mapped address.");
+
+			// Read enough bytes to parse PE headers (4 KB is sufficient for section table)
+			int headerSize = (int)Math.Min(targetModule.Size, 8192u);
+			var headerBytes = targetModule.Process.ReadMemory(targetModule.Address, headerSize);
+
+			try {
+				using var peImage = new dnlib.PE.PEImage(headerBytes, dnlib.PE.ImageLayout.Memory, false);
+				var ntHdr = peImage.ImageNTHeaders;
+				bool is64 = ntHdr?.OptionalHeader?.Magic == 0x20B; // PE32+ magic
+				ulong imageBase = ntHdr?.OptionalHeader?.ImageBase ?? 0;
+				uint entryPoint = ntHdr?.OptionalHeader != null ? (uint)ntHdr.OptionalHeader.AddressOfEntryPoint : 0;
+				var dataDirs = ntHdr?.OptionalHeader?.DataDirectories;
+				bool isDotNet = dataDirs != null && dataDirs.Length > 14 &&
+					(uint)dataDirs[14].VirtualAddress != 0;
+
+				var sections = peImage.ImageSectionHeaders.Select(s => new {
+					Name = s.DisplayName,
+					VirtualAddress = $"0x{(uint)s.VirtualAddress:X8}",
+					VirtualSize = s.VirtualSize,
+					PointerToRawData = $"0x{s.PointerToRawData:X8}",
+					SizeOfRawData = s.SizeOfRawData,
+					Characteristics = DescribeSectionCharacteristics((uint)s.Characteristics),
+					CharacteristicsRaw = $"0x{(uint)s.Characteristics:X8}"
+				}).ToList();
+
+				var result = JsonSerializer.Serialize(new {
+					Module = targetModule.Name,
+					BaseAddress = $"0x{targetModule.Address:X16}",
+					ModuleSize = targetModule.Size,
+					ImageBase = $"0x{imageBase:X16}",
+					EntryPoint = $"0x{entryPoint:X8}",
+					Bitness = is64 ? 64 : 32,
+					IsDotNet = isDotNet,
+					ImageLayout = targetModule.ImageLayout.ToString(),
+					SectionCount = sections.Count,
+					Sections = sections
+				}, new JsonSerializerOptions { WriteIndented = true });
+
+				return new CallToolResult {
+					Content = new List<ToolContent> { new ToolContent { Text = result } }
+				};
+			}
+			catch (Exception ex) {
+				throw new InvalidOperationException($"Failed to parse PE headers for '{moduleName}': {ex.Message}");
+			}
+		}
+
+		// ── dump_pe_section ───────────────────────────────────────────────────────
+
+		/// <summary>
+		/// Dumps a specific PE section from a loaded module. Writes to disk and returns base64.
+		/// Arguments: module_name (required), section_name (required, e.g. ".text"),
+		///            output_path (optional), process_id (int, optional)
+		/// </summary>
+		public CallToolResult DumpPeSection(Dictionary<string, object>? arguments) {
+			if (arguments == null)
+				throw new ArgumentException("Arguments required");
+			if (!arguments.TryGetValue("module_name", out var moduleNameObj))
+				throw new ArgumentException("module_name is required");
+			if (!arguments.TryGetValue("section_name", out var sectionNameObj))
+				throw new ArgumentException("section_name is required");
+
+			var moduleName = moduleNameObj.ToString() ?? string.Empty;
+			var sectionName = sectionNameObj.ToString() ?? string.Empty;
+
+			string? outputPath = null;
+			if (arguments.TryGetValue("output_path", out var opObj))
+				outputPath = opObj?.ToString();
+
+			int? filterPid = null;
+			if (arguments.TryGetValue("process_id", out var pidObj) && pidObj is JsonElement pidElem && pidElem.TryGetInt32(out var pidInt))
+				filterPid = pidInt;
+
+			var mgr = dbgManager.Value;
+			if (!mgr.IsDebugging)
+				throw new InvalidOperationException("Debugger is not active.");
+
+			var (targetModule, _) = FindModule(mgr, moduleName, filterPid);
+			if (targetModule == null)
+				throw new ArgumentException($"Module '{moduleName}' not found.");
+			if (!targetModule.HasAddress)
+				throw new InvalidOperationException($"Module '{moduleName}' has no mapped address.");
+
+			int moduleSize = (int)targetModule.Size;
+			var moduleBytes = targetModule.Process.ReadMemory(targetModule.Address, moduleSize);
+
+			using var peImage = new dnlib.PE.PEImage(moduleBytes, dnlib.PE.ImageLayout.Memory, false);
+
+			var section = peImage.ImageSectionHeaders.FirstOrDefault(s =>
+				s.DisplayName.Equals(sectionName, StringComparison.OrdinalIgnoreCase) ||
+				s.DisplayName.TrimEnd('\0').Equals(sectionName.TrimStart('.'), StringComparison.OrdinalIgnoreCase));
+
+			if (section == null) {
+				var available = string.Join(", ", peImage.ImageSectionHeaders.Select(s => s.DisplayName));
+				throw new ArgumentException($"Section '{sectionName}' not found. Available: {available}");
+			}
+
+			uint va = (uint)section.VirtualAddress;
+			uint sz = Math.Max(section.VirtualSize, section.SizeOfRawData);
+			sz = Math.Min(sz, (uint)(moduleBytes.Length - (int)va));
+
+			var sectionBytes = new byte[sz];
+			Array.Copy(moduleBytes, (int)va, sectionBytes, 0, (int)sz);
+
+			if (!string.IsNullOrEmpty(outputPath)) {
+				var dir = Path.GetDirectoryName(outputPath);
+				if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+				File.WriteAllBytes(outputPath, sectionBytes);
+			}
+
+			var json = JsonSerializer.Serialize(new {
+				Module = targetModule.Name,
+				Section = section.DisplayName,
+				VirtualAddress = $"0x{va:X8}",
+				AbsoluteAddress = $"0x{targetModule.Address + va:X16}",
+				SizeBytes = sz,
+				OutputPath = outputPath,
+				Base64 = Convert.ToBase64String(sectionBytes),
+				Characteristics = DescribeSectionCharacteristics((uint)section.Characteristics)
+			}, new JsonSerializerOptions { WriteIndented = true });
+
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = json } }
+			};
+		}
+
+		// ── dump_module_unpacked ──────────────────────────────────────────────────
+
+		/// <summary>
+		/// Full module dump with optional memory→file layout conversion.
+		/// Handles .NET, native, and mixed-mode modules. Preferred over dump_module_from_memory
+		/// when you need a file that loads cleanly in IDA/Ghidra/dnSpy.
+		/// Arguments: module_name (required), output_path (required),
+		///            try_fix_pe_layout (bool, default=true), process_id (int, optional)
+		/// </summary>
+		public CallToolResult DumpModuleUnpacked(Dictionary<string, object>? arguments) {
+			if (arguments == null)
+				throw new ArgumentException("Arguments required");
+			if (!arguments.TryGetValue("module_name", out var moduleNameObj))
+				throw new ArgumentException("module_name is required");
+			if (!arguments.TryGetValue("output_path", out var outputPathObj))
+				throw new ArgumentException("output_path is required");
+
+			var moduleName = moduleNameObj.ToString() ?? string.Empty;
+			var outputPath = outputPathObj.ToString() ?? string.Empty;
+
+			bool fixLayout = true;
+			if (arguments.TryGetValue("try_fix_pe_layout", out var fixObj)) {
+				if (fixObj is bool fb) fixLayout = fb;
+				else if (fixObj is JsonElement fe) fixLayout = fe.ValueKind == JsonValueKind.True;
+				else if (fixObj?.ToString()?.ToLowerInvariant() == "false") fixLayout = false;
+			}
+
+			int? filterPid = null;
+			if (arguments.TryGetValue("process_id", out var pidObj) && pidObj is JsonElement pidElem && pidElem.TryGetInt32(out var pidInt))
+				filterPid = pidInt;
+
+			var mgr = dbgManager.Value;
+			if (!mgr.IsDebugging)
+				throw new InvalidOperationException("Debugger is not active.");
+
+			var (targetModule, targetRuntime) = FindModule(mgr, moduleName, filterPid);
+			if (targetModule == null)
+				throw new ArgumentException($"Module '{moduleName}' not found. Use list_runtime_modules.");
+
+			var outDir = Path.GetDirectoryName(outputPath);
+			if (!string.IsNullOrEmpty(outDir)) Directory.CreateDirectory(outDir);
+
+			// Strategy A: IDbgDotNetRuntime.GetRawModuleBytes (best quality for .NET)
+			if (targetRuntime?.InternalRuntime is IDbgDotNetRuntime dotNetRuntime) {
+				try {
+					var rawData = dotNetRuntime.GetRawModuleBytes(targetModule);
+					if (rawData.RawBytes != null && rawData.RawBytes.Length > 0) {
+						File.WriteAllBytes(outputPath, rawData.RawBytes);
+						var j = JsonSerializer.Serialize(new {
+							Success = true, Module = targetModule.Name, OutputPath = outputPath,
+							SizeBytes = rawData.RawBytes.Length, IsFileLayout = rawData.IsFileLayout,
+							Method = "IDbgDotNetRuntime.GetRawModuleBytes",
+							Note = "High-quality .NET module bytes. Ready to load in dnSpy."
+						}, new JsonSerializerOptions { WriteIndented = true });
+						return new CallToolResult { Content = new List<ToolContent> { new ToolContent { Text = j } } };
+					}
+				}
+				catch (Exception ex) {
+					McpLogger.Exception(ex, $"GetRawModuleBytes failed for {moduleName}, falling back to ReadMemory");
+				}
+			}
+
+			// Strategy B: ReadMemory + optional PE layout fix
+			if (!targetModule.HasAddress)
+				throw new InvalidOperationException($"Module '{moduleName}' has no mapped address.");
+
+			int moduleSize = (int)targetModule.Size;
+			if (moduleSize <= 0 || moduleSize > 512 * 1024 * 1024)
+				throw new InvalidOperationException($"Module size out of safe range: {moduleSize:N0} bytes.");
+
+			var bytes = targetModule.Process.ReadMemory(targetModule.Address, moduleSize);
+			bool isMemoryLayout = targetModule.ImageLayout == DbgImageLayout.Memory;
+			string method;
+			int finalSize;
+
+			if (fixLayout && isMemoryLayout) {
+				var fixedBytes = TryConvertMemoryToFileLayout(bytes, out int fixedSize);
+				if (fixedBytes != null) {
+					File.WriteAllBytes(outputPath, fixedBytes.Take(fixedSize).ToArray());
+					method = "ReadMemory+PELayoutFix";
+					finalSize = fixedSize;
+				}
+				else {
+					File.WriteAllBytes(outputPath, bytes);
+					method = "ReadMemory (PE fix failed, raw dump)";
+					finalSize = bytes.Length;
+				}
+			}
+			else {
+				File.WriteAllBytes(outputPath, bytes);
+				method = "ReadMemory (raw)";
+				finalSize = bytes.Length;
+			}
+
+			var result = JsonSerializer.Serialize(new {
+				Success = true, Module = targetModule.Name, OutputPath = outputPath,
+				OriginalSize = bytes.Length, FileLayoutSize = finalSize,
+				IsFileLayout = fixLayout && isMemoryLayout,
+				Method = method,
+				Warning = isMemoryLayout && !fixLayout
+					? "Memory layout dump. Use a PE fixer (LordPE, CFF Explorer) before analysis."
+					: null
+			}, new JsonSerializerOptions {
+				WriteIndented = true,
+				DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+			});
+
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = result } }
+			};
+		}
+
+		// ── dump_memory_to_file ───────────────────────────────────────────────────
+
+		/// <summary>
+		/// Saves a raw memory range from the debugged process to a file.
+		/// Complement of read_process_memory (which returns hex/base64 but has 64KB limit).
+		/// Arguments: address (hex/dec), size (up to 256MB), output_path (required),
+		///            process_id (int, optional)
+		/// </summary>
+		public CallToolResult DumpMemoryToFile(Dictionary<string, object>? arguments) {
+			if (arguments == null)
+				throw new ArgumentException("Arguments required");
+			if (!arguments.TryGetValue("address", out var addressObj))
+				throw new ArgumentException("address is required");
+			if (!arguments.TryGetValue("size", out var sizeObj))
+				throw new ArgumentException("size is required");
+			if (!arguments.TryGetValue("output_path", out var outputPathObj))
+				throw new ArgumentException("output_path is required");
+
+			var addressStr = (addressObj?.ToString() ?? string.Empty).Trim();
+			if (!TryParseAddress(addressStr, out ulong address))
+				throw new ArgumentException($"Invalid address '{addressStr}'.");
+
+			int size = 0;
+			if (sizeObj is JsonElement sizeElem) sizeElem.TryGetInt32(out size);
+			else int.TryParse(sizeObj?.ToString(), out size);
+			if (size <= 0 || size > 256 * 1024 * 1024)
+				throw new ArgumentException($"size must be 1..268435456 (256 MB), got {size}.");
+
+			var outputPath = outputPathObj?.ToString() ?? string.Empty;
+			if (string.IsNullOrWhiteSpace(outputPath))
+				throw new ArgumentException("output_path must not be empty.");
+
+			int? filterPid = null;
+			if (arguments.TryGetValue("process_id", out var pidObj) && pidObj is JsonElement pidElem && pidElem.TryGetInt32(out var pidInt))
+				filterPid = pidInt;
+
+			var mgr = dbgManager.Value;
+			if (!mgr.IsDebugging)
+				throw new InvalidOperationException("Debugger is not active.");
+
+			DbgProcess? process = filterPid.HasValue
+				? mgr.Processes.FirstOrDefault(p => p.Id == filterPid.Value)
+				: mgr.Processes.FirstOrDefault(p => p.State == DbgProcessState.Paused)
+				  ?? mgr.Processes.FirstOrDefault();
+
+			if (process == null)
+				throw new InvalidOperationException("No debugged process found.");
+
+			var bytes = process.ReadMemory(address, size);
+
+			var dir = Path.GetDirectoryName(outputPath);
+			if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+			File.WriteAllBytes(outputPath, bytes);
+
+			var json = JsonSerializer.Serialize(new {
+				ProcessId = process.Id,
+				ProcessName = process.Name,
+				Address = $"0x{address:X16}",
+				SizeRequested = size,
+				SizeRead = bytes.Length,
+				OutputPath = outputPath,
+				Note = bytes.Length < size ? "Partial read — some pages may be inaccessible." : null
+			}, new JsonSerializerOptions {
+				WriteIndented = true,
+				DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+			});
+
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = json } }
+			};
+		}
+
 		// ── Helpers ──────────────────────────────────────────────────────────────
 
 		static System.Text.RegularExpressions.Regex BuildPatternRegex(string pattern) {
@@ -350,6 +685,83 @@ namespace dnSpy.MCP.Server.Application {
 				sb.AppendLine("|");
 			}
 			return sb.ToString().TrimEnd();
+		}
+
+		/// <summary>Helper: find a DbgModule by name across all processes/runtimes.</summary>
+		(DbgModule? module, DbgRuntime? runtime) FindModule(DbgManager mgr, string moduleName, int? filterPid) {
+			foreach (var process in mgr.Processes) {
+				if (filterPid.HasValue && process.Id != filterPid.Value) continue;
+				foreach (var runtime in process.Runtimes) {
+					var found = runtime.Modules.FirstOrDefault(m =>
+						(m.Name ?? string.Empty).Equals(moduleName, StringComparison.OrdinalIgnoreCase) ||
+						(m.Filename ?? string.Empty).Equals(moduleName, StringComparison.OrdinalIgnoreCase) ||
+						Path.GetFileName(m.Filename ?? string.Empty).Equals(moduleName, StringComparison.OrdinalIgnoreCase));
+					if (found != null) return (found, runtime);
+				}
+			}
+			return (null, null);
+		}
+
+		/// <summary>
+		/// Attempts to convert a memory-layout PE dump to a file-layout PE.
+		/// Copies section data from their virtual addresses to their raw file offsets.
+		/// Returns null if conversion fails (malformed PE / no sections).
+		/// </summary>
+		static byte[]? TryConvertMemoryToFileLayout(byte[] memBytes, out int finalSize) {
+			finalSize = 0;
+			try {
+				using var peImage = new dnlib.PE.PEImage(memBytes, dnlib.PE.ImageLayout.Memory, false);
+
+				var sections = peImage.ImageSectionHeaders;
+				if (sections == null || sections.Count == 0) return null;
+
+				// Calculate required output size: max(PointerToRawData + SizeOfRawData)
+				uint sizeOfHeaders = peImage.ImageNTHeaders?.OptionalHeader?.SizeOfHeaders ?? 0x400;
+				uint maxRawEnd = sizeOfHeaders;
+				foreach (var s in sections) {
+					uint end = s.PointerToRawData + s.SizeOfRawData;
+					if (end > maxRawEnd) maxRawEnd = end;
+				}
+
+				if (maxRawEnd == 0 || maxRawEnd > 512 * 1024 * 1024u) return null;
+
+				var fileBytes = new byte[maxRawEnd];
+
+				// Copy PE headers
+				int hdrCopy = (int)Math.Min(sizeOfHeaders, (uint)memBytes.Length);
+				Array.Copy(memBytes, 0, fileBytes, 0, hdrCopy);
+
+				// Copy each section from its virtual address to its file offset
+				foreach (var s in sections) {
+					uint va = (uint)s.VirtualAddress;
+					uint ptr = s.PointerToRawData;
+					uint rawSz = s.SizeOfRawData;
+					uint virtSz = s.VirtualSize;
+					uint copyLen = Math.Min(rawSz, Math.Min(virtSz > 0 ? virtSz : rawSz, (uint)(memBytes.Length - (int)va)));
+
+					if (va + copyLen > memBytes.Length || ptr + copyLen > fileBytes.Length) continue;
+					Array.Copy(memBytes, (int)va, fileBytes, (int)ptr, (int)copyLen);
+				}
+
+				finalSize = (int)maxRawEnd;
+				return fileBytes;
+			}
+			catch {
+				return null;
+			}
+		}
+
+		static string DescribeSectionCharacteristics(uint ch) {
+			var parts = new List<string>();
+			if ((ch & 0x00000020) != 0) parts.Add("CODE");
+			if ((ch & 0x00000040) != 0) parts.Add("INITIALIZED_DATA");
+			if ((ch & 0x00000080) != 0) parts.Add("UNINITIALIZED_DATA");
+			if ((ch & 0x02000000) != 0) parts.Add("DISCARDABLE");
+			if ((ch & 0x10000000) != 0) parts.Add("SHARED");
+			if ((ch & 0x20000000) != 0) parts.Add("EXECUTE");
+			if ((ch & 0x40000000) != 0) parts.Add("READ");
+			if ((ch & 0x80000000u) != 0) parts.Add("WRITE");
+			return parts.Count > 0 ? string.Join("|", parts) : $"0x{ch:X8}";
 		}
 	}
 }

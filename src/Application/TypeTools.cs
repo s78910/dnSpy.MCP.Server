@@ -522,24 +522,28 @@ namespace dnSpy.MCP.Server.Application
 
                 foreach (var prop in currentType.Properties)
                 {
-                    var propType = prop.PropertySig?.RetType?.ToTypeDefOrRef()?.ResolveTypeDef();
-                    if (propType != null && !visited.Contains(propType.FullName))
-                    {
-                        visited.Add(propType.FullName);
-                        var newPath = new List<string>(currentPath) { prop.Name.String };
-                        queue.Enqueue((propType, newPath));
-                    }
+                    try {
+                        var propType = prop.PropertySig?.RetType?.ToTypeDefOrRef()?.ResolveTypeDef();
+                        if (propType != null && !visited.Contains(propType.FullName))
+                        {
+                            visited.Add(propType.FullName);
+                            var newPath = new List<string>(currentPath) { prop.Name.String };
+                            queue.Enqueue((propType, newPath));
+                        }
+                    } catch { /* skip unresolvable types */ }
                 }
 
                 foreach (var field in currentType.Fields)
                 {
-                    var fieldType = field.FieldType?.ToTypeDefOrRef()?.ResolveTypeDef();
-                    if (fieldType != null && !visited.Contains(fieldType.FullName))
-                    {
-                        visited.Add(fieldType.FullName);
-                        var newPath = new List<string>(currentPath) { field.Name.String };
-                        queue.Enqueue((fieldType, newPath));
-                    }
+                    try {
+                        var fieldType = field.FieldType?.ToTypeDefOrRef()?.ResolveTypeDef();
+                        if (fieldType != null && !visited.Contains(fieldType.FullName))
+                        {
+                            visited.Add(fieldType.FullName);
+                            var newPath = new List<string>(currentPath) { field.Name.String };
+                            queue.Enqueue((fieldType, newPath));
+                        }
+                    } catch { /* skip unresolvable types */ }
                 }
             }
 
@@ -834,6 +838,91 @@ namespace dnSpy.MCP.Server.Application
                 Method = method.FullName,
                 ExceptionHandlerCount = handlers.Count,
                 ExceptionHandlers = handlers
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            return new CallToolResult
+            {
+                Content = new List<ToolContent> { new ToolContent { Text = result } }
+            };
+        }
+
+        public CallToolResult GetMethodSignature(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null)
+                throw new ArgumentException("Arguments required");
+            if (!arguments.TryGetValue("assembly_name", out var assemblyNameObj))
+                throw new ArgumentException("assembly_name is required");
+            if (!arguments.TryGetValue("type_full_name", out var typeNameObj))
+                throw new ArgumentException("type_full_name is required");
+            if (!arguments.TryGetValue("method_name", out var methodNameObj))
+                throw new ArgumentException("method_name is required");
+
+            var assemblyName = assemblyNameObj.ToString() ?? string.Empty;
+            var typeFullName = typeNameObj.ToString() ?? string.Empty;
+            var methodName = methodNameObj.ToString() ?? string.Empty;
+
+            var assembly = FindAssemblyByName(assemblyName);
+            if (assembly == null)
+                throw new ArgumentException($"Assembly not found: {assemblyName}");
+
+            var type = FindTypeInAssembly(assembly, typeFullName);
+            if (type == null)
+                throw new ArgumentException($"Type not found: {typeFullName}");
+
+            var method = type.Methods.FirstOrDefault(m => m.Name.String == methodName);
+            if (method == null)
+                throw new ArgumentException($"Method not found: {methodName}");
+
+            var parameters = method.Parameters
+                .Where(p => p.IsNormalMethodParameter)
+                .Select(p => new {
+                    Name = p.Name ?? $"param{p.MethodSigIndex}",
+                    Type = p.Type.FullName,
+                    Index = p.MethodSigIndex
+                })
+                .ToList();
+
+            var genericParams = method.GenericParameters
+                .Select(gp => new {
+                    Name = gp.Name.String,
+                    Index = (int)gp.Number,
+                    Constraints = gp.GenericParamConstraints
+                        .Select(c => c.Constraint?.FullName ?? "unknown")
+                        .ToList()
+                })
+                .ToList();
+
+            var customAttribs = method.CustomAttributes
+                .Select(ca => ca.AttributeType?.FullName ?? "Unknown")
+                .ToList();
+
+            string visibility;
+            if (method.IsPublic) visibility = "public";
+            else if (method.IsFamilyOrAssembly) visibility = "protected internal";
+            else if (method.IsFamily) visibility = "protected";
+            else if (method.IsAssembly) visibility = "internal";
+            else if (method.IsFamilyAndAssembly) visibility = "private protected";
+            else if (method.IsPrivate) visibility = "private";
+            else visibility = "unknown";
+
+            var result = JsonSerializer.Serialize(new {
+                FullName = method.FullName,
+                Name = method.Name.String,
+                ReturnType = method.ReturnType.FullName,
+                IsStatic = method.IsStatic,
+                IsVirtual = method.IsVirtual,
+                IsAbstract = method.IsAbstract,
+                IsConstructor = method.IsConstructor,
+                IsGenericMethod = method.HasGenericParameters,
+                Visibility = visibility,
+                CallingConvention = method.CallingConvention.ToString(),
+                HasBody = method.Body != null,
+                Parameters = parameters,
+                ParameterCount = parameters.Count,
+                GenericParameters = genericParams,
+                CustomAttributes = customAttribs,
+                IsOverride = method.IsVirtual && !method.IsNewSlot,
+                DeclaringType = method.DeclaringType?.FullName ?? "Unknown"
             }, new JsonSerializerOptions { WriteIndented = true });
 
             return new CallToolResult

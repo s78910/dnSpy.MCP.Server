@@ -499,7 +499,547 @@ namespace dnSpy.MCP.Server.Application {
 			};
 		}
 
-		// ── Helpers ─────────────────────────────────────────────────────────────
+		// ── Assembly Metadata ───────────────────────────────────────────────────
+
+	/// <summary>
+	/// Returns all metadata fields of an assembly.
+	/// Arguments: assembly_name
+	/// </summary>
+	public CallToolResult GetAssemblyMetadata(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var module = assembly.ManifestModule;
+		var flags = assembly.Attributes;
+
+		var metadata = new {
+			Name = assembly.Name.String,
+			Version = assembly.Version?.ToString() ?? "0.0.0.0",
+			Culture = assembly.Culture ?? "",
+			PublicKey = assembly.HasPublicKey
+				? BitConverter.ToString(assembly.PublicKey.Data).Replace("-", "").ToLower()
+				: "",
+			PublicKeyToken = assembly.PublicKeyToken != null
+				? BitConverter.ToString(assembly.PublicKeyToken.Data).Replace("-", "").ToLower()
+				: "",
+			HashAlgorithm = assembly.HashAlgorithm.ToString(),
+			Flags = flags.ToString(),
+			FlagsRaw = (uint)flags,
+			HasPublicKey = assembly.HasPublicKey,
+			IsRetargetable = (flags & AssemblyAttributes.Retargetable) != 0,
+			DisableJITOptimizer = (flags & AssemblyAttributes.DisableJITcompileOptimizer) != 0,
+			EnableJITTracking = (flags & AssemblyAttributes.EnableJITcompileTracking) != 0,
+			ProcessorArchitecture = (flags & AssemblyAttributes.PA_FullMask) switch {
+				AssemblyAttributes.PA_x86    => "x86",
+				AssemblyAttributes.PA_AMD64  => "AMD64",
+				AssemblyAttributes.PA_IA64   => "IA64",
+				AssemblyAttributes.PA_ARM    => "ARM",
+				_                            => "AnyCPU"
+			},
+			ContentType = (flags & AssemblyAttributes.ContentType_Mask) == AssemblyAttributes.ContentType_WindowsRuntime
+				? "WindowsRuntime" : "Default",
+			Location = module?.Location ?? "",
+			ModuleCount = assembly.Modules.Count,
+			CustomAttributes = assembly.CustomAttributes
+				.Select(ca => new {
+					Type = ca.AttributeType?.FullName ?? "Unknown",
+					Args = ca.ConstructorArguments.Select(a => a.Value?.ToString() ?? "null").ToList()
+				}).ToList()
+		};
+
+		var result = JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true });
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Edits assembly-level metadata fields.
+	/// Arguments: assembly_name, new_name (opt), version (opt, "1.2.3.4"), culture (opt), hash_algorithm (opt: SHA1/MD5/None)
+	/// Changes are in-memory until save_assembly is called.
+	/// </summary>
+	public CallToolResult EditAssemblyMetadata(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var changes = new List<string>();
+
+		if (arguments.TryGetValue("new_name", out var newNameObj) && newNameObj?.ToString() is string newName && newName.Length > 0) {
+			assembly.Name = newName;
+			changes.Add($"Name → {newName}");
+		}
+
+		if (arguments.TryGetValue("version", out var versionObj) && versionObj?.ToString() is string versionStr) {
+			if (!Version.TryParse(versionStr, out var newVersion))
+				throw new ArgumentException($"Invalid version format: '{versionStr}'. Expected: major.minor.build.revision");
+			assembly.Version = newVersion;
+			changes.Add($"Version → {newVersion}");
+		}
+
+		if (arguments.TryGetValue("culture", out var cultureObj)) {
+			assembly.Culture = cultureObj?.ToString() ?? "";
+			changes.Add($"Culture → '{assembly.Culture}'");
+		}
+
+		if (arguments.TryGetValue("hash_algorithm", out var hashObj) && hashObj?.ToString() is string hashStr) {
+			assembly.HashAlgorithm = hashStr.ToUpperInvariant() switch {
+				"SHA1" => AssemblyHashAlgorithm.SHA1,
+				"MD5"  => AssemblyHashAlgorithm.MD5,
+				"NONE" or "0" => AssemblyHashAlgorithm.None,
+				_ => throw new ArgumentException($"Invalid hash_algorithm: '{hashStr}'. Use: SHA1, MD5, None")
+			};
+			changes.Add($"HashAlgorithm → {assembly.HashAlgorithm}");
+		}
+
+		if (changes.Count == 0)
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = "No changes specified. Provide at least one of: new_name, version, culture, hash_algorithm." } }
+			};
+
+		var summary = string.Join("\n", changes.Select(c => "  • " + c));
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent {
+				Text = $"Assembly '{asmNameObj}' metadata updated:\n{summary}\nNote: Use save_assembly to persist to disk."
+			} }
+		};
+	}
+
+	/// <summary>
+	/// Sets or clears an individual assembly attribute flag.
+	/// Arguments: assembly_name, flag_name, value (bool)
+	/// flag_name values: PublicKey | Retargetable | DisableJITOptimizer | EnableJITTracking | WindowsRuntime
+	///   ProcessorArchitecture: MSIL | x86 | AMD64 | ARM | ARM64 | IA64 | AnyCPU
+	/// </summary>
+	public CallToolResult SetAssemblyFlags(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("flag_name", out var flagNameObj))
+			throw new ArgumentException("flag_name is required");
+		if (!arguments.TryGetValue("value", out var valueObj))
+			throw new ArgumentException("value is required (true/false, or architecture name for ProcessorArchitecture)");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var flagName = flagNameObj.ToString()?.ToLowerInvariant() ?? "";
+		var valueStr = valueObj.ToString() ?? "";
+		var current = assembly.Attributes;
+
+		string change;
+		switch (flagName) {
+			case "publickey":
+				var boolPK = ParseBool(valueStr, flagName);
+				assembly.Attributes = boolPK ? (current | AssemblyAttributes.PublicKey) : (current & ~AssemblyAttributes.PublicKey);
+				change = $"PublicKey = {boolPK}";
+				break;
+			case "retargetable":
+				var boolR = ParseBool(valueStr, flagName);
+				assembly.Attributes = boolR ? (current | AssemblyAttributes.Retargetable) : (current & ~AssemblyAttributes.Retargetable);
+				change = $"Retargetable = {boolR}";
+				break;
+			case "disablejitoptimizer":
+				var boolDJ = ParseBool(valueStr, flagName);
+				assembly.Attributes = boolDJ ? (current | AssemblyAttributes.DisableJITcompileOptimizer) : (current & ~AssemblyAttributes.DisableJITcompileOptimizer);
+				change = $"DisableJITOptimizer = {boolDJ}";
+				break;
+			case "enablejittracking":
+				var boolEJ = ParseBool(valueStr, flagName);
+				assembly.Attributes = boolEJ ? (current | AssemblyAttributes.EnableJITcompileTracking) : (current & ~AssemblyAttributes.EnableJITcompileTracking);
+				change = $"EnableJITTracking = {boolEJ}";
+				break;
+			case "windowsruntime":
+				var boolWR = ParseBool(valueStr, flagName);
+				assembly.Attributes = (current & ~AssemblyAttributes.ContentType_Mask) |
+					(boolWR ? AssemblyAttributes.ContentType_WindowsRuntime : AssemblyAttributes.ContentType_Default);
+				change = $"ContentType = {(boolWR ? "WindowsRuntime" : "Default")}";
+				break;
+			case "processorarchitecture":
+				var arch = valueStr.ToUpperInvariant() switch {
+					"ANYCPU" or "NONE" or "MSIL" => AssemblyAttributes.PA_MSIL,
+					"X86" or "I386"              => AssemblyAttributes.PA_x86,
+					"AMD64" or "X64"             => AssemblyAttributes.PA_AMD64,
+					"ARM"                        => AssemblyAttributes.PA_ARM,
+					"ARM64"                      => AssemblyAttributes.PA_ARM64,
+					"IA64"                       => AssemblyAttributes.PA_IA64,
+					_ => throw new ArgumentException($"Unknown architecture '{valueStr}'. Use: AnyCPU, x86, AMD64, ARM, ARM64, IA64")
+				};
+				assembly.Attributes = (current & ~AssemblyAttributes.PA_FullMask) | arch | AssemblyAttributes.PA_Specified;
+				change = $"ProcessorArchitecture = {valueStr}";
+				break;
+			default:
+				throw new ArgumentException(
+					$"Unknown flag_name: '{flagName}'. Valid: PublicKey, Retargetable, DisableJITOptimizer, EnableJITTracking, WindowsRuntime, ProcessorArchitecture");
+		}
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent {
+				Text = $"Flag updated on '{asmNameObj}': {change}\nNew flags: {assembly.Attributes}\nNote: Use save_assembly to persist."
+			} }
+		};
+	}
+
+	static bool ParseBool(string s, string paramName) =>
+		s.ToLowerInvariant() switch {
+			"true" or "1" or "yes" => true,
+			"false" or "0" or "no" => false,
+			_ => throw new ArgumentException($"'{paramName}' value must be true/false, got: '{s}'")
+		};
+
+	// ── Assembly References ──────────────────────────────────────────────────
+
+	/// <summary>
+	/// Lists all assembly references in a module's manifest.
+	/// Arguments: assembly_name
+	/// </summary>
+	public CallToolResult ListAssemblyReferences(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var module = assembly.ManifestModule;
+		var refs = module.GetAssemblyRefs().Select((r, i) => new {
+			Index = i,
+			Name = r.Name.String,
+			Version = r.Version?.ToString() ?? "0.0.0.0",
+			Culture = r.Culture ?? "",
+			PublicKeyToken = r.PublicKeyOrToken?.Data != null && r.PublicKeyOrToken.Data.Length > 0
+				? BitConverter.ToString(r.PublicKeyOrToken.Data).Replace("-", "").ToLower()
+				: "",
+			IsRetargetable = r.IsRetargetable,
+			IsWindowsRuntime = (r.Attributes & AssemblyAttributes.ContentType_WindowsRuntime) != 0,
+			FullName = r.FullName
+		}).ToList();
+
+		var result = JsonSerializer.Serialize(new {
+			Assembly = assembly.Name.String,
+			ReferenceCount = refs.Count,
+			References = refs
+		}, new JsonSerializerOptions { WriteIndented = true });
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Adds an assembly reference by loading a DLL from disk.
+	/// Creates an AssemblyRef entry and a TypeForwarder to anchor it in the manifest.
+	/// Arguments: assembly_name, dll_path, type_name (opt: specific type to forward, defaults to first public type)
+	/// Changes are in-memory until save_assembly is called.
+	/// </summary>
+	public CallToolResult AddAssemblyReference(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("dll_path", out var dllPathObj))
+			throw new ArgumentException("dll_path is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var dllPath = dllPathObj.ToString() ?? "";
+		if (!System.IO.File.Exists(dllPath))
+			throw new ArgumentException($"DLL not found at path: {dllPath}");
+
+		var targetModule = assembly.ManifestModule;
+
+		using var srcModule = ModuleDefMD.Load(dllPath);
+		var srcAssembly = srcModule.Assembly
+			?? throw new ArgumentException("Source file is not an assembly (no manifest): " + dllPath);
+
+		// Build the AssemblyRef
+		var asmRef = new AssemblyRefUser(
+			srcAssembly.Name,
+			srcAssembly.Version,
+			srcAssembly.PublicKeyToken,
+			srcAssembly.Culture);
+
+		// Find anchor type to create a TypeForwarder (ensures AssemblyRef is serialized)
+		string? anchorTypeName = null;
+		string? anchorTypeNamespace = null;
+		if (arguments.TryGetValue("type_name", out var typeNameObj) && typeNameObj?.ToString() is string tn && tn.Length > 0) {
+			var src = srcModule.Types.FirstOrDefault(t => t.FullName == tn || t.Name.String == tn)
+				?? throw new ArgumentException($"Type '{tn}' not found in source DLL");
+			anchorTypeName = src.Name.String;
+			anchorTypeNamespace = src.Namespace.String;
+		}
+		else {
+			var firstPublic = srcModule.Types.FirstOrDefault(t => t.IsPublic);
+			if (firstPublic != null) {
+				anchorTypeName = firstPublic.Name.String;
+				anchorTypeNamespace = firstPublic.Namespace.String;
+			}
+		}
+
+		string typeForwardInfo;
+		if (anchorTypeName != null) {
+			// TypeForwarder: declares this assembly re-exports the type from the referenced assembly
+			var exported = new ExportedTypeUser(targetModule, 0,
+				new UTF8String(anchorTypeNamespace ?? ""), new UTF8String(anchorTypeName),
+				TypeAttributes.Public, asmRef);
+			targetModule.ExportedTypes.Add(exported);
+			typeForwardInfo = $"TypeForwarder added: {anchorTypeNamespace}.{anchorTypeName} → {srcAssembly.Name}";
+		}
+		else {
+			// No public types — create a minimal TypeRef on the <Module> type so AssemblyRef is referenced
+			var modType = targetModule.GlobalType;
+			var typeRef = new TypeRefUser(targetModule, "Object", "System", asmRef);
+			// Add as a custom attribute constructor ref (we use a dummy CA to carry the reference)
+			typeForwardInfo = "No public types in source DLL; AssemblyRef created without TypeForwarder (may not persist without an explicit TypeRef usage).";
+		}
+
+		var result = JsonSerializer.Serialize(new {
+			Added = srcAssembly.FullName,
+			SourcePath = dllPath,
+			TypeForwarder = typeForwardInfo,
+			Note = "Call save_assembly to write changes to disk."
+		}, new JsonSerializerOptions { WriteIndented = true });
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Deep-clones a type from an external DLL file into the target assembly.
+	/// Copies fields, methods (with IL body), properties, and events.
+	/// Arguments: assembly_name, dll_path, source_type, target_namespace (opt), overwrite (opt bool)
+	/// Changes are in-memory until save_assembly is called.
+	/// </summary>
+	public CallToolResult InjectTypeFromDll(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("dll_path", out var dllPathObj))
+			throw new ArgumentException("dll_path is required");
+		if (!arguments.TryGetValue("source_type", out var srcTypeObj))
+			throw new ArgumentException("source_type is required (full name of type to inject)");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var dllPath = dllPathObj.ToString() ?? "";
+		if (!System.IO.File.Exists(dllPath))
+			throw new ArgumentException($"DLL not found: {dllPath}");
+
+		var sourceTypeName = srcTypeObj.ToString() ?? "";
+		var targetModule = assembly.ManifestModule;
+
+		string? targetNamespace = null;
+		if (arguments.TryGetValue("target_namespace", out var nsObj))
+			targetNamespace = nsObj?.ToString();
+
+		bool overwrite = false;
+		if (arguments.TryGetValue("overwrite", out var owObj)) {
+			if (owObj is bool owBool)
+				overwrite = owBool;
+			else if (owObj is System.Text.Json.JsonElement owElem)
+				overwrite = owElem.ValueKind == System.Text.Json.JsonValueKind.True;
+			else if (owObj?.ToString()?.ToLowerInvariant() == "true")
+				overwrite = true;
+		}
+
+		using var srcModule = ModuleDefMD.Load(dllPath);
+		var srcType = srcModule.Types.FirstOrDefault(t =>
+			t.FullName == sourceTypeName || t.Name.String == sourceTypeName)
+			?? throw new ArgumentException($"Type '{sourceTypeName}' not found in {dllPath}");
+
+		var finalNs = targetNamespace ?? srcType.Namespace.String;
+		var finalName = srcType.Name.String;
+
+		// Check for existing type
+		var existing = targetModule.Types.FirstOrDefault(t =>
+			t.Name.String == finalName && t.Namespace.String == finalNs);
+		if (existing != null) {
+			if (!overwrite)
+				throw new ArgumentException(
+					$"Type '{finalNs}.{finalName}' already exists. Set overwrite=true to replace it.");
+			targetModule.Types.Remove(existing);
+		}
+
+		// Importer remaps type references from srcModule → targetModule
+		var importer = new Importer(targetModule, ImporterOptions.TryToUseDefs);
+
+		// ── Create the new TypeDef ──
+		var newType = new TypeDefUser(finalNs, finalName,
+			srcType.BaseType != null ? importer.Import(srcType.BaseType) : null) {
+			Attributes = srcType.Attributes
+		};
+
+		// Generic parameters
+		foreach (var gp in srcType.GenericParameters) {
+			var ngp = new GenericParamUser(gp.Number, gp.Flags, gp.Name);
+			foreach (var c in gp.GenericParamConstraints)
+				ngp.GenericParamConstraints.Add(new GenericParamConstraintUser(importer.Import(c.Constraint)));
+			newType.GenericParameters.Add(ngp);
+		}
+
+		// Interfaces
+		foreach (var iface in srcType.Interfaces)
+			newType.Interfaces.Add(new InterfaceImplUser(importer.Import(iface.Interface)));
+
+		// Fields
+		foreach (var srcField in srcType.Fields) {
+			var newField = new FieldDefUser(srcField.Name,
+				(FieldSig)importer.Import(srcField.FieldSig)!,
+				srcField.Attributes);
+			if (srcField.HasConstant && srcField.Constant != null)
+				newField.Constant = new ConstantUser(srcField.Constant.Value, srcField.Constant.Type);
+			newType.Fields.Add(newField);
+		}
+
+		// Methods (with IL)
+		foreach (var srcMethod in srcType.Methods) {
+			var newMethod = new MethodDefUser(srcMethod.Name,
+				(MethodSig)importer.Import(srcMethod.MethodSig)!,
+				srcMethod.ImplAttributes,
+				srcMethod.Attributes);
+
+			// Generic parameters
+			foreach (var gp in srcMethod.GenericParameters) {
+				var ngp = new GenericParamUser(gp.Number, gp.Flags, gp.Name);
+				newMethod.GenericParameters.Add(ngp);
+			}
+
+			// Parameters (for names/defaults)
+			foreach (var p in srcMethod.ParamDefs) {
+				var np = new ParamDefUser(p.Name, p.Sequence, p.Attributes);
+				newMethod.ParamDefs.Add(np);
+			}
+
+			// IL body
+			if (srcMethod.HasBody && srcMethod.Body != null) {
+				var srcBody = srcMethod.Body;
+				var newBody = new dnlib.DotNet.Emit.CilBody {
+					MaxStack = srcBody.MaxStack,
+					InitLocals = srcBody.InitLocals,
+					KeepOldMaxStack = srcBody.KeepOldMaxStack,
+				};
+
+				// Locals
+				var localMap = new Dictionary<dnlib.DotNet.Emit.Local, dnlib.DotNet.Emit.Local>();
+				foreach (var loc in srcBody.Variables) {
+					var nl = new dnlib.DotNet.Emit.Local(importer.Import(loc.Type)) { Name = loc.Name };
+					newBody.Variables.Add(nl);
+					localMap[loc] = nl;
+				}
+
+				// Instructions — first pass: create stubs (needed for branch target mapping)
+				var instrMap = new Dictionary<dnlib.DotNet.Emit.Instruction, dnlib.DotNet.Emit.Instruction>();
+				foreach (var srcInstr in srcBody.Instructions) {
+					var newInstr = new dnlib.DotNet.Emit.Instruction(srcInstr.OpCode);
+					instrMap[srcInstr] = newInstr;
+					newBody.Instructions.Add(newInstr);
+				}
+
+				// Instructions — second pass: fix operands
+				for (int i = 0; i < srcBody.Instructions.Count; i++) {
+					var si = srcBody.Instructions[i];
+					var ni = newBody.Instructions[i];
+					ni.Operand = si.Operand switch {
+						dnlib.DotNet.Emit.Instruction target
+							=> instrMap.TryGetValue(target, out var mapped) ? mapped : null,
+						dnlib.DotNet.Emit.Instruction[] targets
+							=> targets.Select(t => instrMap.TryGetValue(t, out var m) ? m : null)
+							          .Where(x => x != null).ToArray(),
+						ITypeDefOrRef tdr    => importer.Import(tdr),
+						IField        fld    => importer.Import(fld),
+						IMethod       mth    => importer.Import(mth),
+							dnlib.DotNet.Emit.Local loc
+							=> localMap.TryGetValue(loc, out var ml) ? ml : (object?)loc,
+						_ => si.Operand  // string, int, float, sbyte, long, double, etc.
+					};
+				}
+
+				// Exception handlers
+				foreach (var eh in srcBody.ExceptionHandlers) {
+					newBody.ExceptionHandlers.Add(new dnlib.DotNet.Emit.ExceptionHandler(eh.HandlerType) {
+						TryStart    = eh.TryStart    != null && instrMap.TryGetValue(eh.TryStart, out var ts)  ? ts  : null,
+						TryEnd      = eh.TryEnd      != null && instrMap.TryGetValue(eh.TryEnd,   out var te)  ? te  : null,
+						HandlerStart= eh.HandlerStart!= null && instrMap.TryGetValue(eh.HandlerStart, out var hs) ? hs : null,
+						HandlerEnd  = eh.HandlerEnd  != null && instrMap.TryGetValue(eh.HandlerEnd,   out var he) ? he : null,
+						FilterStart = eh.FilterStart != null && instrMap.TryGetValue(eh.FilterStart,  out var fs) ? fs : null,
+						CatchType   = eh.CatchType   != null ? importer.Import(eh.CatchType) : null,
+					});
+				}
+
+				newMethod.Body = newBody;
+			}
+
+			newType.Methods.Add(newMethod);
+		}
+
+		// Properties
+		foreach (var srcProp in srcType.Properties) {
+			var newProp = new PropertyDefUser(srcProp.Name,
+				(PropertySig)importer.Import(srcProp.PropertySig)!,
+				srcProp.Attributes);
+			if (srcProp.GetMethod != null)
+				newProp.GetMethod = newType.Methods.FirstOrDefault(m => m.Name.String == srcProp.GetMethod.Name.String);
+			if (srcProp.SetMethod != null)
+				newProp.SetMethod = newType.Methods.FirstOrDefault(m => m.Name.String == srcProp.SetMethod.Name.String);
+			newType.Properties.Add(newProp);
+		}
+
+		// Events
+		foreach (var srcEvent in srcType.Events) {
+			var newEvent = new EventDefUser(srcEvent.Name,
+				srcEvent.EventType != null ? importer.Import(srcEvent.EventType) : null,
+				srcEvent.Attributes);
+			if (srcEvent.AddMethod != null)
+				newEvent.AddMethod = newType.Methods.FirstOrDefault(m => m.Name.String == srcEvent.AddMethod.Name.String);
+			if (srcEvent.RemoveMethod != null)
+				newEvent.RemoveMethod = newType.Methods.FirstOrDefault(m => m.Name.String == srcEvent.RemoveMethod.Name.String);
+			if (srcEvent.InvokeMethod != null)
+				newEvent.InvokeMethod = newType.Methods.FirstOrDefault(m => m.Name.String == srcEvent.InvokeMethod.Name.String);
+			newType.Events.Add(newEvent);
+		}
+
+		targetModule.Types.Add(newType);
+
+		var stats = new {
+			InjectedType  = $"{finalNs}.{finalName}",
+			SourceDll     = System.IO.Path.GetFileName(dllPath),
+			SourceType    = srcType.FullName,
+			Overwritten   = existing != null,
+			Fields        = newType.Fields.Count,
+			Methods       = newType.Methods.Count,
+			Properties    = newType.Properties.Count,
+			Events        = newType.Events.Count,
+			Interfaces    = newType.Interfaces.Count,
+			Note          = "Call save_assembly to persist to disk."
+		};
+		var result = JsonSerializer.Serialize(stats, new JsonSerializerOptions { WriteIndented = true });
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	// ── Helpers ─────────────────────────────────────────────────────────────
 
 		static List<object> ExtractCustomAttributes(IList<CustomAttribute> attrs) {
 			var result = new List<object>();
