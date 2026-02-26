@@ -6,6 +6,7 @@ using System.Text.Json;
 using dnlib.DotNet;
 using dnSpy.Contracts.Documents.TreeView;
 using dnSpy.MCP.Server.Contracts;
+using System.Text.Json.Serialization;
 
 namespace dnSpy.MCP.Server.Application
 {
@@ -331,6 +332,87 @@ namespace dnSpy.MCP.Server.Application
             {
                 Content = new List<ToolContent> { new ToolContent { Text = result } }
             };
+        }
+
+        // ── MCP-compatible wrappers (accept Dictionary<string,object>) ───────────
+
+        /// <summary>MCP wrapper for find_who_uses_type.</summary>
+        public CallToolResult FindWhoUsesTypeArgs(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null || !arguments.TryGetValue("assembly_name", out var asmObj))
+                throw new ArgumentException("assembly_name is required");
+            if (!arguments.TryGetValue("type_full_name", out var typeObj))
+                throw new ArgumentException("type_full_name is required");
+
+            var asmName  = asmObj.ToString()  ?? "";
+            var typeName = typeObj.ToString() ?? "";
+
+            var assembly = FindAssemblyByName(asmName);
+            if (assembly == null)
+                throw new ArgumentException($"Assembly not found: {asmName}");
+
+            var targetType = GetAllAssemblyTypes(assembly)
+                .FirstOrDefault(t => t.FullName.Equals(typeName, StringComparison.OrdinalIgnoreCase));
+            if (targetType == null)
+                throw new ArgumentException($"Type not found: {typeName}");
+
+            return FindWhoUsesType(assembly, targetType);
+        }
+
+        /// <summary>MCP wrapper for find_who_reads_field.</summary>
+        public CallToolResult FindWhoReadsFieldArgs(Dictionary<string, object>? arguments)
+        {
+            var (assembly, type, fieldName) = ResolveFieldArgs(arguments, "find_who_reads_field");
+            var field = type.Fields.FirstOrDefault(f => f.Name.String.Equals(fieldName, StringComparison.OrdinalIgnoreCase));
+            if (field == null)
+                throw new ArgumentException($"Field not found: {fieldName}");
+            return FindWhoReadsField(field);
+        }
+
+        /// <summary>MCP wrapper for find_who_writes_field.</summary>
+        public CallToolResult FindWhoWritesFieldArgs(Dictionary<string, object>? arguments)
+        {
+            var (assembly, type, fieldName) = ResolveFieldArgs(arguments, "find_who_writes_field");
+            var field = type.Fields.FirstOrDefault(f => f.Name.String.Equals(fieldName, StringComparison.OrdinalIgnoreCase));
+            if (field == null)
+                throw new ArgumentException($"Field not found: {fieldName}");
+            return FindWhoWritesField(field);
+        }
+
+        // ── Private lookup helpers ───────────────────────────────────────────────
+
+        private AssemblyDef? FindAssemblyByName(string name) =>
+            documentTreeView.GetAllModuleNodes()
+                .Select(m => m.Document?.AssemblyDef)
+                .FirstOrDefault(a => a?.Name.String.Equals(name, StringComparison.OrdinalIgnoreCase) == true);
+
+        private IEnumerable<TypeDef> GetAllAssemblyTypes(AssemblyDef asm) =>
+            asm.Modules.SelectMany(m => GetAllTypesRecursive(m));
+
+        private (AssemblyDef asm, TypeDef type, string fieldName) ResolveFieldArgs(
+            Dictionary<string, object>? arguments, string toolName)
+        {
+            if (arguments == null || !arguments.TryGetValue("assembly_name", out var asmObj))
+                throw new ArgumentException("assembly_name is required");
+            if (!arguments.TryGetValue("type_full_name", out var typeObj))
+                throw new ArgumentException("type_full_name is required");
+            if (!arguments.TryGetValue("field_name", out var fieldObj))
+                throw new ArgumentException("field_name is required");
+
+            var asmName   = asmObj.ToString()   ?? "";
+            var typeName  = typeObj.ToString()  ?? "";
+            var fieldName = fieldObj.ToString() ?? "";
+
+            var assembly = FindAssemblyByName(asmName);
+            if (assembly == null)
+                throw new ArgumentException($"Assembly not found: {asmName}");
+
+            var type = GetAllAssemblyTypes(assembly)
+                .FirstOrDefault(t => t.FullName.Equals(typeName, StringComparison.OrdinalIgnoreCase));
+            if (type == null)
+                throw new ArgumentException($"Type not found: {typeName}");
+
+            return (assembly, type, fieldName);
         }
     }
 }

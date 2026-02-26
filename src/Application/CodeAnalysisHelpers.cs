@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.Composition;
 using System.Linq;
+using System.Text.Json;
 using dnlib.DotNet;
 using dnSpy.Contracts.Documents.TreeView;
+using dnSpy.MCP.Server.Contracts;
 
 namespace dnSpy.MCP.Server.Application
 {
@@ -10,15 +13,15 @@ namespace dnSpy.MCP.Server.Application
     /// Phase 5: Code Analysis Helpers
     /// Provides utilities for analyzing call graphs, dependencies, data flow, and dead code.
     /// </summary>
+    [Export(typeof(CodeAnalysisHelpers))]
     public sealed class CodeAnalysisHelpers
     {
         private readonly IDocumentTreeView documentTreeView;
-        private readonly UsageFindingCommandTools usageTools;
 
-        public CodeAnalysisHelpers(IDocumentTreeView documentTreeView, UsageFindingCommandTools usageTools)
+        [ImportingConstructor]
+        public CodeAnalysisHelpers(IDocumentTreeView documentTreeView)
         {
             this.documentTreeView = documentTreeView ?? throw new ArgumentNullException(nameof(documentTreeView));
-            this.usageTools = usageTools ?? throw new ArgumentNullException(nameof(usageTools));
         }
 
         /// <summary>
@@ -367,5 +370,126 @@ namespace dnSpy.MCP.Server.Application
                     yield return deepNested;
             }
         }
+
+        // ── MCP-compatible wrappers ──────────────────────────────────────────────
+
+        /// <summary>MCP wrapper for analyze_call_graph.</summary>
+        public CallToolResult AnalyzeCallGraphArgs(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null || !arguments.TryGetValue("assembly_name", out var asmObj))
+                throw new ArgumentException("assembly_name is required");
+            if (!arguments.TryGetValue("type_full_name", out var typeObj))
+                throw new ArgumentException("type_full_name is required");
+            if (!arguments.TryGetValue("method_name", out var methodObj))
+                throw new ArgumentException("method_name is required");
+
+            int maxDepth = 5;
+            if (arguments.TryGetValue("max_depth", out var depthObj) && depthObj is System.Text.Json.JsonElement depthElem && depthElem.TryGetInt32(out var d))
+                maxDepth = d;
+
+            var assembly = FindAssemblyByName(asmObj.ToString() ?? "");
+            if (assembly == null) throw new ArgumentException($"Assembly not found: {asmObj}");
+
+            var type = FindTypeInAssembly(assembly, typeObj.ToString() ?? "");
+            if (type == null) throw new ArgumentException($"Type not found: {typeObj}");
+
+            var methodName = methodObj.ToString() ?? "";
+            var method = type.Methods.FirstOrDefault(m => m.Name.String.Equals(methodName, StringComparison.OrdinalIgnoreCase));
+            if (method == null) throw new ArgumentException($"Method not found: {methodName}");
+
+            var graph = BuildCallGraph(method, maxDepth);
+            var json = JsonSerializer.Serialize(graph, new JsonSerializerOptions { WriteIndented = true });
+            return new CallToolResult { Content = new List<ToolContent> { new ToolContent { Text = json } } };
+        }
+
+        /// <summary>MCP wrapper for find_dependency_chain.</summary>
+        public CallToolResult FindDependencyChainArgs(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null || !arguments.TryGetValue("assembly_name", out var asmObj))
+                throw new ArgumentException("assembly_name is required");
+            if (!arguments.TryGetValue("from_type", out var fromObj))
+                throw new ArgumentException("from_type is required");
+            if (!arguments.TryGetValue("to_type", out var toObj))
+                throw new ArgumentException("to_type is required");
+
+            int maxLength = 10;
+            if (arguments.TryGetValue("max_length", out var lenObj) && lenObj is System.Text.Json.JsonElement lenElem && lenElem.TryGetInt32(out var l))
+                maxLength = l;
+
+            var assembly = FindAssemblyByName(asmObj.ToString() ?? "");
+            if (assembly == null) throw new ArgumentException($"Assembly not found: {asmObj}");
+
+            var allTypes = assembly.Modules.SelectMany(m => GetAllTypesRecursive(m)).ToList();
+
+            var fromTypeName = fromObj.ToString() ?? "";
+            var toTypeName   = toObj.ToString()   ?? "";
+
+            var fromType = allTypes.FirstOrDefault(t => t.FullName.Equals(fromTypeName, StringComparison.OrdinalIgnoreCase));
+            if (fromType == null) throw new ArgumentException($"from_type not found: {fromTypeName}");
+
+            var toType = allTypes.FirstOrDefault(t => t.FullName.Equals(toTypeName, StringComparison.OrdinalIgnoreCase)
+                                                    || t.Name.String.Equals(toTypeName, StringComparison.OrdinalIgnoreCase));
+            if (toType == null) throw new ArgumentException($"to_type not found: {toTypeName}");
+
+            var paths = FindDependencyPaths(fromType, toType, maxLength);
+            var json = JsonSerializer.Serialize(new {
+                FromType  = fromType.FullName,
+                ToType    = toType.FullName,
+                PathCount = paths.Count,
+                Paths     = paths
+            }, new JsonSerializerOptions { WriteIndented = true });
+            return new CallToolResult { Content = new List<ToolContent> { new ToolContent { Text = json } } };
+        }
+
+        /// <summary>MCP wrapper for analyze_cross_assembly_dependencies.</summary>
+        public CallToolResult AnalyzeCrossAssemblyDependenciesArgs(Dictionary<string, object>? arguments)
+        {
+            var deps = ComputeAssemblyDependencies();
+            var json = JsonSerializer.Serialize(new {
+                AssemblyCount        = deps.Count,
+                AssemblyDependencies = deps
+            }, new JsonSerializerOptions { WriteIndented = true });
+            return new CallToolResult { Content = new List<ToolContent> { new ToolContent { Text = json } } };
+        }
+
+        /// <summary>MCP wrapper for find_dead_code.</summary>
+        public CallToolResult FindDeadCodeArgs(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null || !arguments.TryGetValue("assembly_name", out var asmObj))
+                throw new ArgumentException("assembly_name is required");
+
+            bool includePrivate = true;
+            if (arguments.TryGetValue("include_private", out var ipObj)) {
+                if (ipObj is bool b) includePrivate = b;
+                else if (ipObj is System.Text.Json.JsonElement ipElem) includePrivate = ipElem.ValueKind == System.Text.Json.JsonValueKind.True;
+                else if (ipObj?.ToString()?.ToLowerInvariant() == "false") includePrivate = false;
+            }
+
+            var assembly = FindAssemblyByName(asmObj.ToString() ?? "");
+            if (assembly == null) throw new ArgumentException($"Assembly not found: {asmObj}");
+
+            var (deadMethods, deadTypes) = IdentifyDeadCode(assembly, includePrivate);
+            var json = JsonSerializer.Serialize(new {
+                Assembly          = assembly.Name.String,
+                DeadMethodCount   = deadMethods.Count,
+                DeadTypeCount     = deadTypes.Count,
+                Note              = "Dead code detection is a static approximation — virtual dispatch, reflection, and external callers are not tracked.",
+                DeadMethods       = deadMethods.OrderBy(m => m).ToList(),
+                DeadTypes         = deadTypes.OrderBy(t => t).ToList()
+            }, new JsonSerializerOptions { WriteIndented = true });
+            return new CallToolResult { Content = new List<ToolContent> { new ToolContent { Text = json } } };
+        }
+
+        // ── Private lookup helpers ───────────────────────────────────────────────
+
+        private AssemblyDef? FindAssemblyByName(string name) =>
+            documentTreeView.GetAllModuleNodes()
+                .Select(m => m.Document?.AssemblyDef)
+                .FirstOrDefault(a => a?.Name.String.Equals(name, StringComparison.OrdinalIgnoreCase) == true);
+
+        private TypeDef? FindTypeInAssembly(AssemblyDef asm, string typeName) =>
+            asm.Modules
+                .SelectMany(m => GetAllTypesRecursive(m))
+                .FirstOrDefault(t => t.FullName.Equals(typeName, StringComparison.OrdinalIgnoreCase));
     }
 }

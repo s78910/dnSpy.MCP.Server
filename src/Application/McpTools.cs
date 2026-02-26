@@ -46,6 +46,11 @@ namespace dnSpy.MCP.Server.Application
         readonly Lazy<DebugTools> debugTools;
         readonly Lazy<DumpTools> dumpTools;
         readonly Lazy<MemoryInspectTools> memoryInspectTools;
+        readonly Lazy<UsageFindingCommandTools> usageFindingTools;
+        readonly Lazy<CodeAnalysisHelpers> codeAnalysisTools;
+#if NETFRAMEWORK
+        readonly Lazy<De4dotTools> de4dotTools;
+#endif
 
         [ImportingConstructor]
         public McpTools(
@@ -56,7 +61,13 @@ namespace dnSpy.MCP.Server.Application
             Lazy<EditTools> editTools,
             Lazy<DebugTools> debugTools,
             Lazy<DumpTools> dumpTools,
-            Lazy<MemoryInspectTools> memoryInspectTools)
+            Lazy<MemoryInspectTools> memoryInspectTools,
+            Lazy<UsageFindingCommandTools> usageFindingTools,
+            Lazy<CodeAnalysisHelpers> codeAnalysisTools
+#if NETFRAMEWORK
+            , Lazy<De4dotTools> de4dotTools
+#endif
+            )
         {
             this.documentTreeView = documentTreeView;
             this.decompilerService = decompilerService;
@@ -66,6 +77,11 @@ namespace dnSpy.MCP.Server.Application
             this.debugTools = debugTools;
             this.dumpTools = dumpTools;
             this.memoryInspectTools = memoryInspectTools;
+            this.usageFindingTools = usageFindingTools;
+            this.codeAnalysisTools = codeAnalysisTools;
+#if NETFRAMEWORK
+            this.de4dotTools = de4dotTools;
+#endif
         }
 
         public List<ToolInfo> GetAvailableTools()
@@ -514,6 +530,32 @@ namespace dnSpy.MCP.Server.Application
                         ["required"] = new List<string> { "assembly_name", "dll_path", "source_type" }
                     }
                 },
+                new ToolInfo {
+                    Name = "list_pinvoke_methods",
+                    Description = "List all P/Invoke (DllImport) declarations in a type, showing the managed method name, metadata token, DLL name, and native function name. Useful for identifying anti-debug or anti-tamper P/Invoke stubs to patch.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type to inspect" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "patch_method_to_ret",
+                    Description = "Replace a method's IL body with a minimal return stub (nop + ret) to neutralize it. Ideal for disabling anti-debug, anti-tamper, or other unwanted routines. Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]   = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly containing the method" },
+                            ["type_full_name"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type containing the method (including namespace)" },
+                            ["method_name"]     = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Simple name of the method to patch" },
+                            ["method_token"]    = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Optional metadata token (hex like 0x06001234 or decimal) to disambiguate overloaded methods" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "method_name" }
+                    }
+                },
 
                 new ToolInfo {
                     Name = "list_events_in_type",
@@ -807,7 +849,207 @@ namespace dnSpy.MCP.Server.Application
                         },
                         ["required"] = new List<string> { "address", "size", "output_path" }
                     }
+                },
+
+                // ── Usage Finding Tools ──────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "find_who_uses_type",
+                    Description = "Find all types, methods, and fields that reference a specific type (as base class, interface, field type, parameter, or return type). Searches across all loaded assemblies.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Assembly containing the target type" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type to search for (e.g. MyNamespace.MyClass)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "find_who_reads_field",
+                    Description = "Find all methods that read a specific field via IL LDFLD/LDSFLD instructions. Searches across all loaded assemblies.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Assembly containing the type that declares the field" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type that declares the field" },
+                            ["field_name"]     = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the field" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "field_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "find_who_writes_field",
+                    Description = "Find all methods that write to a specific field via IL STFLD/STSFLD instructions. Searches across all loaded assemblies.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Assembly containing the type that declares the field" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type that declares the field" },
+                            ["field_name"]     = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the field" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "field_name" }
+                    }
+                },
+
+                // ── Code Analysis Tools ──────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "analyze_call_graph",
+                    Description = "Build a recursive call graph for a method, showing all methods it calls down to a configurable depth. Useful for understanding execution flow.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type containing the method" },
+                            ["method_name"]    = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the method to analyze" },
+                            ["max_depth"]      = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Maximum recursion depth (default 5)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "type_full_name", "method_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "find_dependency_chain",
+                    Description = "Find all dependency paths (via base types, interfaces, fields, parameters, return types) between two types using BFS traversal.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly to search in" },
+                            ["from_type"]     = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the starting type" },
+                            ["to_type"]       = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name (or simple name) of the target type" },
+                            ["max_length"]    = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Maximum path length (default 10)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "from_type", "to_type" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "analyze_cross_assembly_dependencies",
+                    Description = "Compute a dependency matrix for all loaded assemblies, showing which assemblies each assembly depends on (via type references).",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "find_dead_code",
+                    Description = "Identify methods and types in an assembly that are never called or referenced (static analysis approximation; virtual dispatch and reflection are not tracked).",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly to analyze" },
+                            ["include_private"] = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Include private members in dead code detection (default true)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "scan_pe_strings",
+                    Description = "Scan the raw PE file bytes for printable ASCII and UTF-16 strings. Useful for finding URLs, API keys, IP addresses, file paths, and other plaintext data embedded in obfuscated or packed assemblies without needing a debug session.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]    = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Name of the loaded assembly to scan" },
+                            ["min_length"]       = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Minimum string length to include (default 5)" },
+                            ["include_utf16"]    = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Also scan for UTF-16 LE strings (default true)" },
+                            ["filter_pattern"]   = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Optional regex to filter results (e.g. 'https?://' to find only URLs)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+
+                // ── Process Launch / Attach Tools ────────────────────────────────────
+                new ToolInfo {
+                    Name = "start_debugging",
+                    Description = "Launch an EXE under the dnSpy debugger. By default breaks at the entry point (after the module initializer has run, so ConfuserEx-decrypted method bodies are already in RAM). Use get_debugger_state to poll until paused.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["exe_path"]          = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Absolute path to the .NET Framework EXE to debug" },
+                            ["arguments"]         = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Command-line arguments passed to the process (optional)" },
+                            ["working_directory"] = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Working directory (default: EXE directory)" },
+                            ["break_kind"]        = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Where to break: EntryPoint (default) | ModuleCctorOrEntryPoint | CreateProcess | DontBreak" }
+                        },
+                        ["required"] = new List<string> { "exe_path" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "attach_to_process",
+                    Description = "Attach the dnSpy debugger to a running .NET process by its PID. Queries all installed debug engine providers for compatible CLR runtimes in the target process.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["process_id"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Process ID (PID) of the target process" }
+                        },
+                        ["required"] = new List<string> { "process_id" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "unpack_from_memory",
+                    Description = "All-in-one unpacker for ConfuserEx and similar packers: launches the EXE under the debugger pausing at EntryPoint (after the module .cctor has decrypted method bodies), dumps the main module with PE-layout fix, and optionally stops the session. The output file contains readable IL and can be deobfuscated with deobfuscate_assembly.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["exe_path"]       = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Absolute path to the packed/protected .NET Framework EXE" },
+                            ["output_path"]    = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Absolute path to write the unpacked EXE (directories are created automatically)" },
+                            ["timeout_ms"]     = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Max milliseconds to wait for the process to pause at entry point (default 30000)" },
+                            ["stop_after_dump"]= new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Stop the debug session after dumping (default true)" },
+                            ["module_name"]    = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Override module name to search for (default: EXE filename). Use list_runtime_modules to discover names if auto-detect fails." }
+                        },
+                        ["required"] = new List<string> { "exe_path", "output_path" }
+                    }
+                },
+
+#if NETFRAMEWORK
+                // ── de4dot Deobfuscation Tools ───────────────────────────────────────
+                new ToolInfo {
+                    Name = "list_deobfuscators",
+                    Description = "List all obfuscator types supported by the integrated de4dot engine (e.g. ConfuserEx, Dotfuscator, SmartAssembly, etc.).",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"]       = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"]   = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "detect_obfuscator",
+                    Description = "Detect which obfuscator was applied to a .NET assembly file on disk. Uses de4dot's heuristic detection engine.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["file_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Absolute path to the target DLL or EXE" }
+                        },
+                        ["required"] = new List<string> { "file_path" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "deobfuscate_assembly",
+                    Description = "Deobfuscate a .NET assembly using de4dot. Renames mangled symbols, deobfuscates control flow, and decrypts strings. Output is saved to disk.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["file_path"]             = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Absolute path to the obfuscated DLL or EXE" },
+                            ["output_path"]           = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Output path for the cleaned file (default: <name>-cleaned<ext> next to input)" },
+                            ["method"]                = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Force a specific deobfuscator by Type, Name, or TypeLong (e.g. 'cr' for ConfuserEx). Auto-detected if omitted." },
+                            ["rename_symbols"]        = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Rename obfuscated symbols (default true)" },
+                            ["control_flow"]          = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Deobfuscate control flow (default true)" },
+                            ["keep_obfuscator_types"] = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Keep obfuscator-internal types in the output (default false)" },
+                            ["string_decrypter"]      = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "String decrypter mode: none | static | delegate | emulate (default static)" }
+                        },
+                        ["required"] = new List<string> { "file_path" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "save_deobfuscated",
+                    Description = "Return a previously deobfuscated file as a Base64-encoded blob. Useful when the output file cannot be accessed directly.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["file_path"]   = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Absolute path to the already-deobfuscated file" },
+                            ["max_size_mb"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Reject files larger than this many megabytes (default 50)" }
+                        },
+                        ["required"] = new List<string> { "file_path" }
+                    }
                 }
+#endif
             };
         }
 
@@ -846,6 +1088,8 @@ namespace dnSpy.MCP.Server.Application
                     "list_assembly_references" => InvokeLazy(editTools, "ListAssemblyReferences", arguments),
                     "add_assembly_reference" => InvokeLazy(editTools, "AddAssemblyReference", arguments),
                     "inject_type_from_dll" => InvokeLazy(editTools, "InjectTypeFromDll", arguments),
+                    "list_pinvoke_methods" => InvokeLazy(editTools, "ListPInvokeMethods", arguments),
+                    "patch_method_to_ret" => InvokeLazy(editTools, "PatchMethodToRet", arguments),
                     "list_events_in_type" => InvokeLazy(editTools, "ListEventsInType", arguments),
                     "get_custom_attributes" => InvokeLazy(editTools, "GetCustomAttributes", arguments),
                     "list_nested_types" => InvokeLazy(editTools, "ListNestedTypes", arguments),
@@ -868,6 +1112,25 @@ namespace dnSpy.MCP.Server.Application
                     // Memory inspect / runtime variable tools
                     "get_local_variables" => InvokeLazy(memoryInspectTools, "GetLocalVariables", arguments),
 
+                    // Usage finding tools
+                    "find_who_uses_type"   => InvokeLazy(usageFindingTools, "FindWhoUsesTypeArgs",   arguments),
+                    "find_who_reads_field" => InvokeLazy(usageFindingTools, "FindWhoReadsFieldArgs", arguments),
+                    "find_who_writes_field" => InvokeLazy(usageFindingTools, "FindWhoWritesFieldArgs", arguments),
+
+                    // Code analysis tools
+                    "analyze_call_graph"                    => InvokeLazy(codeAnalysisTools, "AnalyzeCallGraphArgs",                    arguments),
+                    "find_dependency_chain"                 => InvokeLazy(codeAnalysisTools, "FindDependencyChainArgs",                 arguments),
+                    "analyze_cross_assembly_dependencies"   => InvokeLazy(codeAnalysisTools, "AnalyzeCrossAssemblyDependenciesArgs",   arguments),
+                    "find_dead_code"                        => InvokeLazy(codeAnalysisTools, "FindDeadCodeArgs",                        arguments),
+
+                    // PE / string scanning tools
+                    "scan_pe_strings" => InvokeLazy(assemblyTools, "ScanPeStrings", arguments),
+
+                    // Process launch / attach / unpack tools
+                    "start_debugging"    => InvokeLazy(debugTools, "StartDebugging",  arguments),
+                    "attach_to_process"  => InvokeLazy(debugTools, "AttachToProcess", arguments),
+                    "unpack_from_memory" => InvokeLazy(dumpTools,  "UnpackFromMemory", arguments),
+
                     // Debug tools
                     "get_debugger_state" => InvokeLazy(debugTools, "GetDebuggerState", arguments),
                     "list_breakpoints" => InvokeLazy(debugTools, "ListBreakpoints", arguments),
@@ -878,6 +1141,14 @@ namespace dnSpy.MCP.Server.Application
                     "break_debugger" => InvokeLazy(debugTools, "BreakDebugger", arguments),
                     "stop_debugging" => InvokeLazy(debugTools, "StopDebugging", arguments),
                     "get_call_stack" => InvokeLazy(debugTools, "GetCallStack", arguments),
+
+#if NETFRAMEWORK
+                    // de4dot deobfuscation tools
+                    "list_deobfuscators"    => InvokeLazy(de4dotTools, "ListDeobfuscators",    arguments),
+                    "detect_obfuscator"     => InvokeLazy(de4dotTools, "DetectObfuscator",     arguments),
+                    "deobfuscate_assembly"  => InvokeLazy(de4dotTools, "DeobfuscateAssembly",  arguments),
+                    "save_deobfuscated"     => InvokeLazy(de4dotTools, "SaveDeobfuscated",     arguments),
+#endif
 
                     _ => new CallToolResult
                     {

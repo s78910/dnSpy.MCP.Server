@@ -24,7 +24,9 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using dnSpy.Contracts.Debugger;
+using dnSpy.Contracts.Debugger.DotNet.CorDebug;
 using dnSpy.Contracts.Debugger.DotNet.Evaluation;
 using dnSpy.MCP.Server.Contracts;
 using dnSpy.MCP.Server.Helper;
@@ -633,6 +635,183 @@ namespace dnSpy.MCP.Server.Application {
 		}
 
 		// ── Helpers ──────────────────────────────────────────────────────────────
+
+		// ── unpack_from_memory ───────────────────────────────────────────────────
+
+		/// <summary>
+		/// All-in-one unpack: launches the EXE under the debugger with BreakKind=EntryPoint
+		/// (so the module .cctor/decryptor has already run), waits until paused, dumps the
+		/// main module with PE-layout fix, and optionally stops the session.
+		/// Arguments: exe_path* | output_path* | timeout_ms (default 30000) |
+		///            stop_after_dump (default true) | module_name (auto-detected if omitted)
+		/// </summary>
+		public CallToolResult UnpackFromMemory(Dictionary<string, object>? arguments) {
+			if (arguments == null)
+				throw new ArgumentException("Arguments required");
+			if (!arguments.TryGetValue("exe_path", out var exePathObj))
+				throw new ArgumentException("exe_path is required");
+			if (!arguments.TryGetValue("output_path", out var outputPathObj))
+				throw new ArgumentException("output_path is required");
+
+			var exePath    = exePathObj.ToString()    ?? string.Empty;
+			var outputPath = outputPathObj.ToString() ?? string.Empty;
+
+			if (!File.Exists(exePath))
+				throw new ArgumentException($"File not found: {exePath}");
+			if (string.IsNullOrWhiteSpace(outputPath))
+				throw new ArgumentException("output_path must not be empty");
+
+			int timeoutMs = 30000;
+			if (arguments.TryGetValue("timeout_ms", out var toObj) && toObj is JsonElement toElem && toElem.TryGetInt32(out var toInt))
+				timeoutMs = Math.Max(3000, toInt);
+
+			bool stopAfterDump = true;
+			if (arguments.TryGetValue("stop_after_dump", out var sadObj)) {
+				if (sadObj is bool sadBool) stopAfterDump = sadBool;
+				else if (sadObj is JsonElement sadElem) stopAfterDump = sadElem.ValueKind != JsonValueKind.False;
+				else if (sadObj?.ToString()?.ToLowerInvariant() == "false") stopAfterDump = false;
+			}
+
+			string? moduleName = null;
+			if (arguments.TryGetValue("module_name", out var mnObj))
+				moduleName = mnObj?.ToString();
+
+			var mgr = dbgManager.Value;
+			var sw  = System.Diagnostics.Stopwatch.StartNew();
+
+			// Launch under debugger if no session is active
+			bool ownedSession = false;
+			if (!mgr.IsDebugging) {
+				var workDir = Path.GetDirectoryName(exePath) ?? Directory.GetCurrentDirectory();
+				var opts = new DotNetFrameworkStartDebuggingOptions {
+					Filename         = exePath,
+					WorkingDirectory = workDir,
+					BreakKind        = PredefinedBreakKinds.EntryPoint,
+				};
+				var launchError = mgr.Start(opts);
+				if (launchError != null)
+					throw new InvalidOperationException($"Failed to launch debugger: {launchError}");
+				ownedSession = true;
+			}
+
+			// Poll until the process pauses at the entry point
+			bool hadProcess = false;
+			var  deadline   = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+			while (DateTime.UtcNow < deadline) {
+				Thread.Sleep(200);
+				var procs = mgr.Processes;
+				if (procs.Length > 0 && mgr.IsRunning == false)
+					break; // paused ✓
+				if (procs.Length == 0 && hadProcess)
+					throw new InvalidOperationException(
+						"Process exited before reaching the entry point. " +
+						"The target may have anti-debug protection or crashed on startup.");
+				if (procs.Length > 0)
+					hadProcess = true;
+			}
+			if (mgr.IsRunning != false || mgr.Processes.Length == 0)
+				throw new TimeoutException(
+					$"Timed out after {timeoutMs}ms waiting for the process to pause at entry point.");
+
+			// Locate the target module
+			var searchName = !string.IsNullOrEmpty(moduleName)
+				? moduleName!
+				: Path.GetFileName(exePath);
+			var (targetModule, targetRuntime) = FindModule(mgr, searchName, null);
+
+			if (targetModule == null) {
+				// Fallback: find the sole exe module across all runtimes of the first process
+				var exeMods = mgr.Processes[0].Runtimes
+					.SelectMany(r => r.Modules.Select(m => (mod: m, rt: r)))
+					.Where(t => t.mod.IsExe)
+					.ToArray();
+				if (exeMods.Length == 1) {
+					targetModule  = exeMods[0].mod;
+					targetRuntime = exeMods[0].rt;
+				}
+				else {
+					var names = string.Join(", ", exeMods.Select(t => t.mod.Name));
+					throw new ArgumentException(
+						$"Module '{searchName}' not found. Loaded exe modules: {names}. " +
+						"Pass module_name explicitly to disambiguate.");
+				}
+			}
+
+			// Ensure output directory exists
+			var outDir = Path.GetDirectoryName(outputPath);
+			if (!string.IsNullOrEmpty(outDir))
+				Directory.CreateDirectory(outDir);
+
+			// Dump with the best available strategy
+			var (dumpMethod, fileSize) = DumpModuleBytesToPath(targetModule, targetRuntime, outputPath);
+
+			sw.Stop();
+
+			// Optionally stop the debug session we started
+			bool stopped = false;
+			if (stopAfterDump && ownedSession) {
+				try {
+					mgr.StopDebuggingAll();
+					stopped = true;
+				}
+				catch (Exception ex) {
+					McpLogger.Exception(ex, "StopDebuggingAll failed after unpack");
+				}
+			}
+
+			var result = JsonSerializer.Serialize(new {
+				ExePath       = exePath,
+				OutputPath    = outputPath,
+				ModuleName    = targetModule.Name,
+				FileSizeBytes = fileSize,
+				Method        = dumpMethod,
+				ElapsedMs     = (int)sw.ElapsedMilliseconds,
+				Stopped       = stopped
+			}, new JsonSerializerOptions { WriteIndented = true });
+
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = result } }
+			};
+		}
+
+		/// <summary>Dump a module to a file using the best available strategy. Returns (method, size).</summary>
+		(string method, int size) DumpModuleBytesToPath(DbgModule module, DbgRuntime? runtime, string outputPath) {
+			// Strategy A: IDbgDotNetRuntime.GetRawModuleBytes — highest-quality .NET dump
+			if (runtime?.InternalRuntime is IDbgDotNetRuntime dotNetRuntime) {
+				try {
+					var rawData = dotNetRuntime.GetRawModuleBytes(module);
+					if (rawData.RawBytes != null && rawData.RawBytes.Length > 0) {
+						File.WriteAllBytes(outputPath, rawData.RawBytes);
+						return ("IDbgDotNetRuntime.GetRawModuleBytes", rawData.RawBytes.Length);
+					}
+				}
+				catch (Exception ex) {
+					McpLogger.Exception(ex, $"GetRawModuleBytes failed for {module.Name}, falling back to ReadMemory");
+				}
+			}
+
+			// Strategy B: ReadMemory + optional PE layout fix
+			if (!module.HasAddress)
+				throw new InvalidOperationException(
+					$"Module '{module.Name}' has no mapped address and GetRawModuleBytes returned nothing.");
+
+			int moduleSize = (int)module.Size;
+			if (moduleSize <= 0 || moduleSize > 512 * 1024 * 1024)
+				throw new InvalidOperationException($"Module size out of safe range: {moduleSize:N0} bytes.");
+
+			var bytes = module.Process.ReadMemory(module.Address, moduleSize);
+
+			if (module.ImageLayout == DbgImageLayout.Memory) {
+				var fixedBytes = TryConvertMemoryToFileLayout(bytes, out int fixedSize);
+				if (fixedBytes != null) {
+					File.WriteAllBytes(outputPath, fixedBytes.Take(fixedSize).ToArray());
+					return ("ReadMemory+PELayoutFix", fixedSize);
+				}
+			}
+
+			File.WriteAllBytes(outputPath, bytes);
+			return ("ReadMemory", bytes.Length);
+		}
 
 		static System.Text.RegularExpressions.Regex BuildPatternRegex(string pattern) {
 			// If the pattern contains regex metacharacters beyond simple wildcards, treat as regex

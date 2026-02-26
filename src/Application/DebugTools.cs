@@ -24,9 +24,11 @@ using System.Linq;
 using System.Text.Json;
 using dnlib.DotNet;
 using dnSpy.Contracts.Debugger;
+using dnSpy.Contracts.Debugger.Attach;
 using dnSpy.Contracts.Debugger.Breakpoints.Code;
 using dnSpy.Contracts.Debugger.CallStack;
 using dnSpy.Contracts.Debugger.DotNet.Breakpoints.Code;
+using dnSpy.Contracts.Debugger.DotNet.CorDebug;
 using dnSpy.Contracts.Documents.TreeView;
 using dnSpy.Contracts.Metadata;
 using dnSpy.MCP.Server.Contracts;
@@ -44,17 +46,20 @@ namespace dnSpy.MCP.Server.Application {
 		readonly Lazy<DbgCodeBreakpointsService> breakpointsService;
 		readonly Lazy<DbgDotNetBreakpointFactory> breakpointFactory;
 		readonly IDocumentTreeView documentTreeView;
+		readonly Lazy<AttachableProcessesService> attachableProcessesService;
 
 		[ImportingConstructor]
 		public DebugTools(
 			Lazy<DbgManager> dbgManager,
 			Lazy<DbgCodeBreakpointsService> breakpointsService,
 			Lazy<DbgDotNetBreakpointFactory> breakpointFactory,
-			IDocumentTreeView documentTreeView) {
+			IDocumentTreeView documentTreeView,
+			Lazy<AttachableProcessesService> attachableProcessesService) {
 			this.dbgManager = dbgManager;
 			this.breakpointsService = breakpointsService;
 			this.breakpointFactory = breakpointFactory;
 			this.documentTreeView = documentTreeView;
+			this.attachableProcessesService = attachableProcessesService;
 		}
 
 		/// <summary>
@@ -382,6 +387,107 @@ namespace dnSpy.MCP.Server.Application {
 					IsError = true
 				};
 			}
+		}
+
+		// ── start_debugging ──────────────────────────────────────────────────────
+
+		/// <summary>
+		/// Launches an EXE under the dnSpy debugger.
+		/// Arguments: exe_path* | arguments | working_directory | break_kind (default "EntryPoint")
+		/// </summary>
+		public CallToolResult StartDebugging(Dictionary<string, object>? arguments) {
+			if (arguments == null)
+				throw new ArgumentException("Arguments required");
+			if (!arguments.TryGetValue("exe_path", out var exePathObj))
+				throw new ArgumentException("exe_path is required");
+
+			var exePath = exePathObj.ToString() ?? string.Empty;
+			if (!System.IO.File.Exists(exePath))
+				throw new ArgumentException($"File not found: {exePath}");
+
+			string? commandLine = null;
+			if (arguments.TryGetValue("arguments", out var argsObj))
+				commandLine = argsObj?.ToString();
+
+			string? workingDir = null;
+			if (arguments.TryGetValue("working_directory", out var wdObj))
+				workingDir = wdObj?.ToString();
+			if (string.IsNullOrEmpty(workingDir))
+				workingDir = System.IO.Path.GetDirectoryName(exePath);
+
+			string breakKind = PredefinedBreakKinds.EntryPoint;
+			if (arguments.TryGetValue("break_kind", out var bkObj) && bkObj?.ToString() is string bkStr && !string.IsNullOrEmpty(bkStr))
+				breakKind = bkStr;
+
+			var opts = new DotNetFrameworkStartDebuggingOptions {
+				Filename         = exePath,
+				CommandLine      = commandLine ?? string.Empty,
+				WorkingDirectory = workingDir,
+				BreakKind        = breakKind,
+			};
+
+			var error = dbgManager.Value.Start(opts);
+
+			var result = JsonSerializer.Serialize(new {
+				Started   = error == null,
+				ExePath   = exePath,
+				BreakKind = breakKind,
+				Error     = error,
+				Note      = error == null
+					? "Process launched asynchronously. Use get_debugger_state to check when it is paused."
+					: null
+			}, new JsonSerializerOptions {
+				WriteIndented = true,
+				DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+			});
+
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = result } }
+			};
+		}
+
+		// ── attach_to_process ────────────────────────────────────────────────────
+
+		/// <summary>
+		/// Attaches the dnSpy debugger to a running .NET process by PID.
+		/// Arguments: process_id*
+		/// </summary>
+		public CallToolResult AttachToProcess(Dictionary<string, object>? arguments) {
+			if (arguments == null)
+				throw new ArgumentException("Arguments required");
+			if (!arguments.TryGetValue("process_id", out var pidObj))
+				throw new ArgumentException("process_id is required");
+
+			int pid = 0;
+			if (pidObj is JsonElement pidElem) pidElem.TryGetInt32(out pid);
+			else int.TryParse(pidObj?.ToString(), out pid);
+			if (pid <= 0)
+				throw new ArgumentException("process_id must be a positive integer");
+
+			var processes = attachableProcessesService.Value
+				.GetAttachableProcessesAsync(null, new[] { pid }, null)
+				.GetAwaiter().GetResult();
+
+			if (processes.Length == 0)
+				throw new ArgumentException(
+					$"No attachable .NET process found with PID {pid}. " +
+					"The process may not exist or does not expose a supported runtime.");
+
+			// Attach to the first matching entry (each entry represents one CLR runtime in the process)
+			var target = processes[0];
+			target.Attach();
+
+			var result = JsonSerializer.Serialize(new {
+				Attached    = true,
+				ProcessId   = pid,
+				RuntimeName = target.RuntimeName,
+				Name        = target.Name,
+				Note        = "Attach is asynchronous. Use get_debugger_state to verify the session."
+			}, new JsonSerializerOptions { WriteIndented = true });
+
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = result } }
+			};
 		}
 
 		// ── Helpers ─────────────────────────────────────────────────────────────

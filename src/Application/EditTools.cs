@@ -23,6 +23,8 @@ using System.ComponentModel.Composition;
 using System.Linq;
 using System.Text.Json;
 using dnlib.DotNet;
+using dnlib.DotNet.Emit;
+using dnlib.DotNet.MD;
 using dnlib.DotNet.Writer;
 using dnSpy.Contracts.Decompiler;
 using dnSpy.Contracts.Documents.TreeView;
@@ -1039,6 +1041,196 @@ namespace dnSpy.MCP.Server.Application {
 		};
 	}
 
+	// ── Method Patching ──────────────────────────────────────────────────────
+
+	/// <summary>
+	/// Lists all P/Invoke (DllImport) declarations in a type.
+	/// Returns the managed method name, token, DLL name, and native function name.
+	/// Arguments: assembly_name, type_full_name
+	/// </summary>
+	public CallToolResult ListPInvokeMethods(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("type_full_name", out var typeNameObj))
+			throw new ArgumentException("type_full_name is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var type = FindTypeInAssemblyAll(assembly, typeNameObj.ToString() ?? "");
+		if (type == null)
+			throw new ArgumentException($"Type not found: {typeNameObj}");
+
+		var pinvokes = type.Methods
+			.Where(m => m.HasImplMap)
+			.Select(m => new {
+				ManagedName = m.Name.String,
+				Token = $"0x{m.MDToken.Raw:X8}",
+				DllName = m.ImplMap?.Module?.Name?.String ?? "",
+				NativeName = m.ImplMap?.Name?.String ?? m.Name.String,
+				ReturnType = m.ReturnType?.FullName ?? "",
+				IsStatic = m.IsStatic,
+				CallingConvention = m.ImplMap?.Attributes.ToString() ?? ""
+			})
+			.ToList();
+
+		var result = JsonSerializer.Serialize(new {
+			Type = type.FullName,
+			PInvokeCount = pinvokes.Count,
+			Methods = pinvokes
+		}, new JsonSerializerOptions { WriteIndented = true });
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Replaces a method's IL body with a minimal return stub to neutralize it.
+	/// Useful for disabling anti-debug, anti-tamper, or other unwanted methods.
+	/// Arguments: assembly_name, type_full_name, method_name, method_token (opt)
+	/// Changes are in-memory until save_assembly is called.
+	/// </summary>
+	public CallToolResult PatchMethodToRet(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("type_full_name", out var typeNameObj))
+			throw new ArgumentException("type_full_name is required");
+		if (!arguments.TryGetValue("method_name", out var methodNameObj))
+			throw new ArgumentException("method_name is required");
+
+		arguments.TryGetValue("method_token", out var methodTokenObj);
+
+		var assemblyName = asmNameObj.ToString() ?? "";
+		var typeFullName = typeNameObj.ToString() ?? "";
+		var methodName = methodNameObj.ToString() ?? "";
+
+		var assembly = FindAssemblyByName(assemblyName);
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {assemblyName}");
+
+		// Search type, including nested types
+		var type = FindTypeInAssemblyAll(assembly, typeFullName);
+		if (type == null)
+			throw new ArgumentException($"Type not found: {typeFullName}");
+
+		MethodDef? method = null;
+
+		// Find by token if provided
+		if (methodTokenObj != null) {
+			var tokenStr = methodTokenObj is System.Text.Json.JsonElement tokenEl
+				? (tokenEl.ValueKind == System.Text.Json.JsonValueKind.String ? tokenEl.GetString() ?? "" : tokenEl.GetRawText())
+				: (methodTokenObj.ToString() ?? "");
+			uint token = ParseToken(tokenStr);
+			if (token != 0)
+				method = type.Methods.FirstOrDefault(m => m.MDToken.Raw == token);
+			if (method == null)
+				throw new ArgumentException($"No method with token '{tokenStr}' found in '{typeFullName}'");
+		}
+
+		// Find by name if no token provided
+		if (method == null) {
+			var matches = type.Methods.Where(m => m.Name.String == methodName).ToList();
+			if (matches.Count == 0)
+				throw new ArgumentException($"Method '{methodName}' not found in type '{typeFullName}'");
+			if (matches.Count > 1)
+				throw new ArgumentException(
+					$"Method '{methodName}' is ambiguous ({matches.Count} overloads in '{typeFullName}'). " +
+					$"Use method_token to disambiguate. Tokens: {string.Join(", ", matches.Select(m => $"0x{m.MDToken.Raw:X8}"))}");
+			method = matches[0];
+		}
+
+		// If this is a P/Invoke method, convert it to a managed IL stub first
+		bool wasPInvoke = method.HasImplMap;
+		if (wasPInvoke) {
+			method.ImplMap = null;
+			method.Attributes &= ~MethodAttributes.PinvokeImpl;
+			method.ImplAttributes = MethodImplAttributes.IL | MethodImplAttributes.Managed;
+		}
+
+		// Build minimal return stub
+		int oldCount = method.Body?.Instructions.Count ?? 0;
+		var newBody = new CilBody();
+		var retType = method.ReturnType;
+
+		switch (retType.ElementType) {
+			case ElementType.Void:
+				break;
+			case ElementType.I8:
+			case ElementType.U8:
+				newBody.Instructions.Add(Instruction.Create(OpCodes.Ldc_I8, 0L));
+				break;
+			case ElementType.R4:
+				newBody.Instructions.Add(Instruction.Create(OpCodes.Ldc_R4, 0f));
+				break;
+			case ElementType.R8:
+				newBody.Instructions.Add(Instruction.Create(OpCodes.Ldc_R8, 0.0));
+				break;
+			case ElementType.Boolean:
+			case ElementType.Char:
+			case ElementType.I1:
+			case ElementType.U1:
+			case ElementType.I2:
+			case ElementType.U2:
+			case ElementType.I4:
+			case ElementType.U4:
+			case ElementType.I:
+			case ElementType.U:
+				newBody.Instructions.Add(Instruction.Create(OpCodes.Ldc_I4_0));
+				break;
+			case ElementType.ValueType: {
+				var loc = new Local(retType);
+				newBody.Variables.Add(loc);
+				newBody.InitLocals = true;
+				newBody.Instructions.Add(Instruction.Create(OpCodes.Ldloca_S, loc));
+				newBody.Instructions.Add(Instruction.Create(OpCodes.Initobj, retType.ToTypeDefOrRef()));
+				newBody.Instructions.Add(Instruction.Create(OpCodes.Ldloc_S, loc));
+				break;
+			}
+			case ElementType.GenericInst: {
+				if (retType.IsValueType) {
+					var loc = new Local(retType);
+					newBody.Variables.Add(loc);
+					newBody.InitLocals = true;
+					newBody.Instructions.Add(Instruction.Create(OpCodes.Ldloca_S, loc));
+					newBody.Instructions.Add(Instruction.Create(OpCodes.Initobj, retType.ToTypeDefOrRef()));
+					newBody.Instructions.Add(Instruction.Create(OpCodes.Ldloc_S, loc));
+				} else {
+					newBody.Instructions.Add(Instruction.Create(OpCodes.Ldnull));
+				}
+				break;
+			}
+			default:
+				// Reference types (Class, Object, String, SZArray, etc.)
+				newBody.Instructions.Add(Instruction.Create(OpCodes.Ldnull));
+				break;
+		}
+
+		newBody.Instructions.Add(Instruction.Create(OpCodes.Ret));
+		method.Body = newBody;
+
+		var result = JsonSerializer.Serialize(new {
+			Patched = true,
+			WasPInvoke = wasPInvoke,
+			TypeFullName = type.FullName,
+			MethodName = method.Name.String,
+			MethodToken = $"0x{method.MDToken.Raw:X8}",
+			ReturnType = retType.FullName,
+			OldInstructionCount = oldCount,
+			NewInstructionCount = newBody.Instructions.Count,
+			Note = "Method body replaced with ret stub. Use save_assembly to persist to disk."
+		}, new JsonSerializerOptions { WriteIndented = true });
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
 	// ── Helpers ─────────────────────────────────────────────────────────────
 
 		static List<object> ExtractCustomAttributes(IList<CustomAttribute> attrs) {
@@ -1121,5 +1313,29 @@ namespace dnSpy.MCP.Server.Application {
 			assembly.Modules
 				.SelectMany(m => m.Types)
 				.FirstOrDefault(t => t.FullName.Equals(fullName, StringComparison.Ordinal));
+
+		TypeDef? FindTypeInAssemblyAll(AssemblyDef assembly, string fullName) =>
+			assembly.Modules
+				.SelectMany(m => GetAllTypesRecursive(m.Types))
+				.FirstOrDefault(t => t.FullName.Equals(fullName, StringComparison.Ordinal));
+
+		static IEnumerable<TypeDef> GetAllTypesRecursive(IEnumerable<TypeDef> types) {
+			foreach (var t in types) {
+				yield return t;
+				foreach (var n in GetAllTypesRecursive(t.NestedTypes))
+					yield return n;
+			}
+		}
+
+		static uint ParseToken(string s) {
+			s = s.Trim();
+			if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) {
+				if (uint.TryParse(s.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out var hex))
+					return hex;
+			}
+			if (uint.TryParse(s, out var dec))
+				return dec;
+			return 0;
+		}
 	}
 }

@@ -222,6 +222,131 @@ namespace dnSpy.MCP.Server.Application
             return new CallToolResult { Content = new List<ToolContent> { new ToolContent { Text = json } } };
         }
 
+        /// <summary>
+        /// Scans the raw PE file bytes for printable ASCII and UTF-16 strings.
+        /// Useful for finding URLs, keys, and other plaintext data in obfuscated assemblies.
+        /// </summary>
+        public CallToolResult ScanPeStrings(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null || !arguments.TryGetValue("assembly_name", out var asmObj))
+                throw new ArgumentException("assembly_name is required");
+
+            var assemblyName = asmObj.ToString() ?? string.Empty;
+
+            // Get file path from the document node
+            var moduleNode = documentTreeView.GetAllModuleNodes()
+                .FirstOrDefault(m => m.Document?.AssemblyDef != null &&
+                    m.Document.AssemblyDef.Name.String.Equals(assemblyName, StringComparison.OrdinalIgnoreCase));
+
+            if (moduleNode == null)
+                throw new ArgumentException($"Assembly not found: {assemblyName}");
+
+            var filePath = moduleNode.Document?.Filename;
+            if (string.IsNullOrEmpty(filePath) || !System.IO.File.Exists(filePath))
+                throw new ArgumentException($"File not found on disk: {filePath ?? "(null)"}");
+
+            int minLength = 5;
+            if (arguments.TryGetValue("min_length", out var minLenObj) &&
+                int.TryParse(minLenObj.ToString(), out var ml) && ml > 0)
+                minLength = ml;
+
+            bool includeUtf16 = true;
+            if (arguments.TryGetValue("include_utf16", out var utf16Obj))
+                bool.TryParse(utf16Obj.ToString(), out includeUtf16);
+
+            string? filterPattern = null;
+            if (arguments.TryGetValue("filter_pattern", out var fObj))
+                filterPattern = fObj.ToString();
+
+            System.Text.RegularExpressions.Regex? filterRx = null;
+            if (!string.IsNullOrEmpty(filterPattern))
+                filterRx = new System.Text.RegularExpressions.Regex(filterPattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+                    System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+            var bytes = System.IO.File.ReadAllBytes(filePath);
+            var found = new List<(string Encoding, string Offset, string Value)>();
+            var seen = new HashSet<string>();
+
+            // Scan ASCII strings
+            int start = -1;
+            for (int i = 0; i <= bytes.Length; i++)
+            {
+                bool printable = i < bytes.Length && bytes[i] >= 0x20 && bytes[i] < 0x7F;
+                if (printable)
+                {
+                    if (start < 0) start = i;
+                }
+                else
+                {
+                    if (start >= 0)
+                    {
+                        int len = i - start;
+                        if (len >= minLength)
+                        {
+                            var s = Encoding.ASCII.GetString(bytes, start, len);
+                            if ((filterRx == null || filterRx.IsMatch(s)) && seen.Add(s))
+                                found.Add(("ASCII", $"0x{start:X}", s));
+                        }
+                        start = -1;
+                    }
+                }
+            }
+
+            // Scan UTF-16 LE strings
+            if (includeUtf16)
+            {
+                start = -1;
+                for (int i = 0; i <= bytes.Length - 1; i += 2)
+                {
+                    bool printable = i + 1 < bytes.Length && bytes[i] >= 0x20 && bytes[i] < 0x7F && bytes[i + 1] == 0x00;
+                    if (printable)
+                    {
+                        if (start < 0) start = i;
+                    }
+                    else
+                    {
+                        if (start >= 0)
+                        {
+                            int len = i - start;
+                            if (len / 2 >= minLength)
+                            {
+                                var s = Encoding.Unicode.GetString(bytes, start, len);
+                                if ((filterRx == null || filterRx.IsMatch(s)) && seen.Add(s))
+                                    found.Add(("UTF-16", $"0x{start:X}", s));
+                            }
+                            start = -1;
+                        }
+                    }
+                }
+            }
+
+            // Highlight suspicious strings (URLs, IPs, emails, paths)
+            var suspicious = new System.Text.RegularExpressions.Regex(
+                @"https?://|ftp://|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|@[a-z0-9-]+\.[a-z]{2,}|[A-Z]:\\|/[a-z]+/|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            var allStrings = found.Select(t => new { Encoding = t.Encoding, Offset = t.Offset, Value = t.Value }).ToList();
+            var suspiciousStrings = found
+                .Where(t => suspicious.IsMatch(t.Value))
+                .Select(t => new { Encoding = t.Encoding, Offset = t.Offset, Value = t.Value })
+                .ToList();
+
+            var result = JsonSerializer.Serialize(new
+            {
+                FilePath = filePath,
+                FileSize = bytes.Length,
+                TotalStrings = found.Count,
+                SuspiciousStrings = suspiciousStrings,
+                AllStrings = allStrings
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            return new CallToolResult
+            {
+                Content = new List<ToolContent> { new ToolContent { Text = result } }
+            };
+        }
+
         AssemblyDef? FindAssemblyByName(string name)
         {
             return documentTreeView.GetAllModuleNodes()

@@ -16,6 +16,35 @@
     <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Logic\dnSpy.Contracts.Logic.csproj" />
     <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger\dnSpy.Contracts.Debugger.csproj" />
     <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger.DotNet\dnSpy.Contracts.Debugger.DotNet.csproj" />
+    <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger.DotNet.CorDebug\dnSpy.Contracts.Debugger.DotNet.CorDebug.csproj" />
+  </ItemGroup>
+
+  <!-- de4dot integration (deobfuscation engine) — reference pre-built net48 DLLs -->
+  <PropertyGroup>
+    <De4DotDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\..\de4dot'))</De4DotDir>
+    <De4DotBin>$(De4DotDir)\Debug\net48</De4DotBin>
+  </PropertyGroup>
+  <ItemGroup Condition=" '$(IsDotNetFramework)' == 'true' ">
+    <Reference Include="de4dot.code">
+      <HintPath>$(De4DotBin)\de4dot.code.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="de4dot.blocks">
+      <HintPath>$(De4DotBin)\de4dot.blocks.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="de4dot.mdecrypt">
+      <HintPath>$(De4DotBin)\de4dot.mdecrypt.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="de4dot.cui">
+      <HintPath>$(De4DotBin)\de4dot.cui.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="AssemblyData">
+      <HintPath>$(De4DotBin)\AssemblyData.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
 
   <ItemGroup>

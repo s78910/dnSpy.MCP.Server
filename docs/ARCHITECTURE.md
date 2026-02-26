@@ -84,13 +84,14 @@ BuildTypeReferenceGraph(type)       // Complete type usage map
 - `FindWhoReadsField()` - Field read tracking
 - `FindWhoWritesField()` - Field write tracking
 
-#### **Section E: Stub Commands (Phase 5+)** (Lines 2,625-2,653)
-- `FindDependencyChain()` - Type dependency paths (pending)
-- `AnalyzeCallGraph()` - Recursive call graphs (pending)
-- `FindExposedInterfaces()` - Internal types in public APIs (pending)
-- `TraceDataFlow()` - Parameter/variable flow (pending)
-- `FindDeadCode()` - Unused code detection (pending)
-- `AnalyzeCrossAssemblyDependencies()` - Assembly dependencies (pending)
+#### **Section E: Code Analysis & Usage Finding Tools** (CodeAnalysisHelpers.cs, UsageFindingCommandTools.cs)
+- `find_who_uses_type` - Type reference graph (✅ implemented)
+- `find_who_reads_field` - Field read tracking via LDFLD/LDSFLD (✅ implemented)
+- `find_who_writes_field` - Field write tracking via STFLD/STSFLD (✅ implemented)
+- `analyze_call_graph` - Recursive call graphs (✅ implemented)
+- `find_dependency_chain` - Type dependency paths via BFS (✅ implemented)
+- `analyze_cross_assembly_dependencies` - Assembly dependency matrix (✅ implemented)
+- `find_dead_code` - Unused method/type detection (✅ implemented)
 
 ---
 
