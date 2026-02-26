@@ -48,9 +48,8 @@ namespace dnSpy.MCP.Server.Application
         readonly Lazy<MemoryInspectTools> memoryInspectTools;
         readonly Lazy<UsageFindingCommandTools> usageFindingTools;
         readonly Lazy<CodeAnalysisHelpers> codeAnalysisTools;
-#if NETFRAMEWORK
+        readonly Lazy<De4dotExeTool> de4dotExeTool;
         readonly Lazy<De4dotTools> de4dotTools;
-#endif
 
         [ImportingConstructor]
         public McpTools(
@@ -63,10 +62,9 @@ namespace dnSpy.MCP.Server.Application
             Lazy<DumpTools> dumpTools,
             Lazy<MemoryInspectTools> memoryInspectTools,
             Lazy<UsageFindingCommandTools> usageFindingTools,
-            Lazy<CodeAnalysisHelpers> codeAnalysisTools
-#if NETFRAMEWORK
-            , Lazy<De4dotTools> de4dotTools
-#endif
+            Lazy<CodeAnalysisHelpers> codeAnalysisTools,
+            Lazy<De4dotExeTool> de4dotExeTool,
+            Lazy<De4dotTools> de4dotTools
             )
         {
             this.documentTreeView = documentTreeView;
@@ -79,9 +77,8 @@ namespace dnSpy.MCP.Server.Application
             this.memoryInspectTools = memoryInspectTools;
             this.usageFindingTools = usageFindingTools;
             this.codeAnalysisTools = codeAnalysisTools;
-#if NETFRAMEWORK
+            this.de4dotExeTool = de4dotExeTool;
             this.de4dotTools = de4dotTools;
-#endif
         }
 
         public List<ToolInfo> GetAvailableTools()
@@ -956,6 +953,57 @@ namespace dnSpy.MCP.Server.Application
                     }
                 },
 
+                // ── Assembly Loading ─────────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "load_assembly",
+                    Description = "Load a .NET assembly into dnSpy from disk or from a running process. Mode 1: provide 'file_path' (absolute path). Mode 2: provide 'pid' to dump from a running process (requires active debug session).",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["file_path"]     = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Absolute path to a .NET assembly (.dll/.exe) or a saved memory dump on disk" },
+                            ["memory_layout"] = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Set true when file_path points to a raw memory-layout dump (VA instead of file offsets). Default false." },
+                            ["pid"]           = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "PID of a running .NET process. Dumps the main module (or the module matching 'module_name') from process memory and loads it." },
+                            ["module_name"]   = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Optional module name filter when using 'pid' (e.g. 'MyApp.dll'). Defaults to the first EXE module." },
+                            ["process_id"]    = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Alias for 'pid'" }
+                        },
+                        ["required"] = new List<string>()
+                    }
+                },
+
+                new ToolInfo {
+                    Name = "select_assembly",
+                    Description = "Select an assembly in the dnSpy document tree view and open it in the active tab. This changes the 'current' assembly context for the decompiler and for all subsequent MCP operations that target the selected assembly. Call this after load_assembly to switch focus to the newly loaded file. Use 'file_path' to disambiguate when multiple assemblies share the same short name.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Short name of the assembly to select (e.g. 'BigBearTuning_unpacked'). Use list_assemblies to see loaded names." },
+                            ["file_path"]     = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Optional: absolute path of the loaded file (FilePath from list_assemblies). Use this to pick the correct one when multiple assemblies share the same name." }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "close_assembly",
+                    Description = "Close (remove) a specific assembly from dnSpy. If multiple assemblies share the same name, use 'file_path' (from list_assemblies) to target a specific one.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Short name of the assembly to close." },
+                            ["file_path"]     = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Optional: absolute path (FilePath from list_assemblies) to close a specific copy when names collide." }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "close_all_assemblies",
+                    Description = "Close all assemblies currently loaded in dnSpy, clearing the document tree.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+
                 // ── Process Launch / Attach Tools ────────────────────────────────────
                 new ToolInfo {
                     Name = "start_debugging",
@@ -998,7 +1046,43 @@ namespace dnSpy.MCP.Server.Application
                     }
                 },
 
-#if NETFRAMEWORK
+                // ── Config Management ─────────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "get_mcp_config",
+                    Description = "Return the current MCP server configuration and the path to mcp-config.json. Use this to find where to edit the config file.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object", ["properties"] = new Dictionary<string, object>(), ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "reload_mcp_config",
+                    Description = "Reload mcp-config.json from disk without restarting dnSpy. Call this after editing the config file to apply changes immediately.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object", ["properties"] = new Dictionary<string, object>(), ["required"] = new List<string>()
+                    }
+                },
+
+                // ── de4dot.exe Wrapper (all builds) ──────────────────────────────────
+                new ToolInfo {
+                    Name = "run_de4dot",
+                    Description = "Run de4dot.exe as an external process to deobfuscate a .NET assembly. Supports all de4dot features including dynamic string decryption and ConfuserEx method decryption. Works in all builds.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["file_path"]        = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Path to the input .NET assembly to deobfuscate." },
+                            ["output_path"]      = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Output path for the cleaned assembly (default: input + .deobfuscated.exe)." },
+                            ["obfuscator_type"]  = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "de4dot type code to force: cr (ConfuserEx), un (unknown/auto), an, bl, co, df, dr3, dr4, ef, etc. Leave empty for auto-detection." },
+                            ["dont_rename"]      = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "If true, don't rename obfuscated symbols (default false)." },
+                            ["no_cflow_deob"]    = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "If true, skip control-flow deobfuscation (default false)." },
+                            ["string_decrypter"] = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "String decrypter mode: none, default, static, delegate, emulate." },
+                            ["extra_args"]       = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Any additional de4dot command-line arguments passed verbatim." },
+                            ["de4dot_path"]      = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Override path to de4dot.exe. If omitted, uses well-known search paths." },
+                            ["timeout_ms"]       = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Maximum time to wait for de4dot to finish (default 120000 ms)." }
+                        },
+                        ["required"] = new List<string> { "file_path" }
+                    }
+                },
+
                 // ── de4dot Deobfuscation Tools ───────────────────────────────────────
                 new ToolInfo {
                     Name = "list_deobfuscators",
@@ -1049,7 +1133,6 @@ namespace dnSpy.MCP.Server.Application
                         ["required"] = new List<string> { "file_path" }
                     }
                 }
-#endif
             };
         }
 
@@ -1062,8 +1145,11 @@ namespace dnSpy.MCP.Server.Application
                 var result = toolName switch
                 {
                     "list_tools" => ListTools(),
-                    "list_assemblies" => InvokeLazy(assemblyTools, "ListAssemblies", null),
-                    "get_assembly_info" => InvokeLazy(assemblyTools, "GetAssemblyInfo", arguments),
+                    "list_assemblies"      => InvokeLazy(assemblyTools, "ListAssemblies",      null),
+                    "select_assembly"      => InvokeLazy(assemblyTools, "SelectAssembly",      arguments),
+                    "close_assembly"       => InvokeLazy(assemblyTools, "CloseAssembly",       arguments),
+                    "close_all_assemblies" => InvokeLazy(assemblyTools, "CloseAllAssemblies",  null),
+                    "get_assembly_info"    => InvokeLazy(assemblyTools, "GetAssemblyInfo",     arguments),
                     "list_types" => InvokeLazy(assemblyTools, "ListTypes", arguments),
                     "get_type_info" => InvokeLazy(typeTools, "GetTypeInfo", arguments),
                     "decompile_method" => InvokeLazy(typeTools, "DecompileMethod", arguments),
@@ -1126,6 +1212,9 @@ namespace dnSpy.MCP.Server.Application
                     // PE / string scanning tools
                     "scan_pe_strings" => InvokeLazy(assemblyTools, "ScanPeStrings", arguments),
 
+                    // Assembly loading
+                    "load_assembly"    => InvokeLazy(assemblyTools, "LoadAssembly",    arguments),
+
                     // Process launch / attach / unpack tools
                     "start_debugging"    => InvokeLazy(debugTools, "StartDebugging",  arguments),
                     "attach_to_process"  => InvokeLazy(debugTools, "AttachToProcess", arguments),
@@ -1142,13 +1231,17 @@ namespace dnSpy.MCP.Server.Application
                     "stop_debugging" => InvokeLazy(debugTools, "StopDebugging", arguments),
                     "get_call_stack" => InvokeLazy(debugTools, "GetCallStack", arguments),
 
-#if NETFRAMEWORK
+                    "run_de4dot"            => InvokeLazy(de4dotExeTool, "RunDe4dot",            arguments),
+
+                    // Config management
+                    "get_mcp_config"    => HandleGetMcpConfig(),
+                    "reload_mcp_config" => HandleReloadMcpConfig(),
+
                     // de4dot deobfuscation tools
                     "list_deobfuscators"    => InvokeLazy(de4dotTools, "ListDeobfuscators",    arguments),
                     "detect_obfuscator"     => InvokeLazy(de4dotTools, "DetectObfuscator",     arguments),
                     "deobfuscate_assembly"  => InvokeLazy(de4dotTools, "DeobfuscateAssembly",  arguments),
                     "save_deobfuscated"     => InvokeLazy(de4dotTools, "SaveDeobfuscated",     arguments),
-#endif
 
                     _ => new CallToolResult
                     {
@@ -1482,6 +1575,38 @@ namespace dnSpy.MCP.Server.Application
             {
                 Content = new List<ToolContent> { new ToolContent { Text = json } }
             };
+        }
+
+        // ── Config management handlers ────────────────────────────────────────
+
+        CallToolResult HandleGetMcpConfig()
+        {
+            var cfg = Configuration.McpConfig.Instance;
+            var resolvedDe4dot = cfg.ResolveDe4dotExe();
+            var json = JsonSerializer.Serialize(new {
+                ConfigFilePath     = Configuration.McpConfig.ConfigFilePath,
+                ConfigFileExists   = System.IO.File.Exists(Configuration.McpConfig.ConfigFilePath),
+                De4dotExePath      = cfg.De4dotExePath,
+                De4dotSearchPaths  = cfg.De4dotSearchPaths,
+                ResolvedDe4dotExe  = resolvedDe4dot,
+                De4dotFound        = resolvedDe4dot != null
+            }, new JsonSerializerOptions { WriteIndented = true });
+            return new CallToolResult { Content = new List<ToolContent> { new ToolContent { Text = json } } };
+        }
+
+        CallToolResult HandleReloadMcpConfig()
+        {
+            var cfg = Configuration.McpConfig.Reload();
+            var resolvedDe4dot = cfg.ResolveDe4dotExe();
+            var json = JsonSerializer.Serialize(new {
+                Status             = "reloaded",
+                ConfigFilePath     = Configuration.McpConfig.ConfigFilePath,
+                De4dotExePath      = cfg.De4dotExePath,
+                De4dotSearchPaths  = cfg.De4dotSearchPaths,
+                ResolvedDe4dotExe  = resolvedDe4dot,
+                De4dotFound        = resolvedDe4dot != null
+            }, new JsonSerializerOptions { WriteIndented = true });
+            return new CallToolResult { Content = new List<ToolContent> { new ToolContent { Text = json } } };
         }
     }
 }

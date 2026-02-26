@@ -19,12 +19,14 @@
     <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger.DotNet.CorDebug\dnSpy.Contracts.Debugger.DotNet.CorDebug.csproj" />
   </ItemGroup>
 
-  <!-- de4dot integration (deobfuscation engine) — reference pre-built net48 DLLs -->
+  <!-- de4dot integration (deobfuscation engine) — DLLs bundled in libs/ -->
+  <!-- net48 build uses libs/de4dot/ (net48 DLLs) -->
+  <!-- net10 build uses libs/de4dot-net8/ (net8 DLLs, compatible with net10) -->
   <PropertyGroup>
-    <De4DotDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\..\de4dot'))</De4DotDir>
-    <De4DotBin>$(De4DotDir)\Debug\net48</De4DotBin>
+    <De4DotBin Condition=" '$(IsDotNetFramework)' == 'true' ">$(MSBuildThisFileDirectory)libs\de4dot</De4DotBin>
+    <De4DotBin Condition=" '$(IsDotNetFramework)' != 'true' ">$(MSBuildThisFileDirectory)libs\de4dot-net8</De4DotBin>
   </PropertyGroup>
-  <ItemGroup Condition=" '$(IsDotNetFramework)' == 'true' ">
+  <ItemGroup>
     <Reference Include="de4dot.code">
       <HintPath>$(De4DotBin)\de4dot.code.dll</HintPath>
       <Private>true</Private>
@@ -64,6 +66,13 @@
     <None Remove="backup\**\*.xaml" />
     <Compile Remove="docs\**\*.cs" />
     <None Remove="docs\**\*.xaml" />
+  </ItemGroup>
+
+  <!-- Config file deployed alongside the DLL — user edits are preserved on rebuild -->
+  <ItemGroup>
+    <None Update="mcp-config.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <!-- Source files under src/ are discovered implicitly by the SDK.

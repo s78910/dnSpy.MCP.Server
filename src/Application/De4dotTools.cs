@@ -1,7 +1,6 @@
 // De4dotTools.cs — de4dot deobfuscation integration for dnSpy MCP Server
 // Mirrors the tools in de4dot.mcp (detect_obfuscator, deobfuscate_assembly,
 // list_deobfuscators, save_deobfuscated) but runs in-process inside dnSpy.
-#if NETFRAMEWORK   // de4dot libraries are only available in the net48 build
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
@@ -345,4 +344,146 @@ namespace dnSpy.MCP.Server.Application
 
     }
 }
-#endif
+
+// ── run_de4dot ────────────────────────────────────────────────────────────────
+
+namespace dnSpy.MCP.Server.Application
+{
+    using System;
+    using System.Collections.Generic;
+    using System.ComponentModel.Composition;
+    using System.Diagnostics;
+    using System.IO;
+    using System.Text;
+    using System.Text.Json;
+    using dnSpy.MCP.Server.Configuration;
+    using dnSpy.MCP.Server.Contracts;
+
+    /// <summary>
+    /// Invokes de4dot.exe as an external process so that all de4dot features
+    /// (including dynamic assembly-server decryption) are available from the MCP
+    /// without requiring the net48 in-process libraries.
+    /// Works in both net10 and net48 builds.
+    /// Path resolution order: argument override → mcp-config.json → sibling repo heuristic.
+    /// </summary>
+    [Export(typeof(De4dotExeTool))]
+    public sealed class De4dotExeTool
+    {
+        static string? FindDe4dotExe(string? explicitPath)
+        {
+            // Argument-level override always wins
+            if (!string.IsNullOrEmpty(explicitPath) && File.Exists(explicitPath))
+                return explicitPath!;
+
+            // Delegate all other resolution to McpConfig
+            return McpConfig.Instance.ResolveDe4dotExe();
+        }
+
+        /// <summary>
+        /// Run de4dot.exe with configurable arguments.
+        /// Arguments:
+        ///   file_path*       – input assembly
+        ///   output_path      – output file (default: file_path + ".deobfuscated.exe")
+        ///   obfuscator_type  – de4dot type code: cr, un, an, bl, co, ... (default: auto)
+        ///   dont_rename      – bool, suppress symbol renaming (default false)
+        ///   no_cflow_deob    – bool, skip control-flow deobfuscation (default false)
+        ///   string_decrypter – none|default|static|delegate|emulate (default: default)
+        ///   extra_args       – free-form extra de4dot arguments string
+        ///   de4dot_path      – override path to de4dot.exe
+        ///   timeout_ms       – max time to wait (default 120000)
+        /// </summary>
+        public CallToolResult RunDe4dot(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null || !arguments.TryGetValue("file_path", out var fpObj) || fpObj?.ToString() is not string filePath || !File.Exists(filePath))
+                throw new ArgumentException("file_path is required and must point to an existing file");
+
+            string? explicitDe4dot = null;
+            if (arguments.TryGetValue("de4dot_path", out var dp)) explicitDe4dot = dp?.ToString();
+            var de4dotExe = FindDe4dotExe(explicitDe4dot)
+                ?? throw new InvalidOperationException(
+                    "de4dot.exe not found. Set 'de4dot_path' argument or place de4dot.exe next to the MCP server DLL.");
+
+            string outputPath = filePath + ".deobfuscated.exe";
+            if (arguments.TryGetValue("output_path", out var op) && !string.IsNullOrWhiteSpace(op?.ToString()))
+                outputPath = op.ToString()!;
+
+            var outDir = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrEmpty(outDir)) Directory.CreateDirectory(outDir);
+
+            // Build argument list
+            var sb = new StringBuilder();
+            sb.Append($"-f \"{filePath}\" -o \"{outputPath}\"");
+
+            if (arguments.TryGetValue("obfuscator_type", out var ot) && !string.IsNullOrWhiteSpace(ot?.ToString()))
+                sb.Append($" -p {ot}");
+
+            if (arguments.TryGetValue("dont_rename", out var dr) && dr?.ToString()?.ToLowerInvariant() == "true")
+                sb.Append(" --dont-rename");
+
+            if (arguments.TryGetValue("no_cflow_deob", out var cf) && cf?.ToString()?.ToLowerInvariant() == "true")
+                sb.Append(" --no-cflow-deob");
+
+            if (arguments.TryGetValue("string_decrypter", out var sd) && !string.IsNullOrWhiteSpace(sd?.ToString()))
+                sb.Append($" --default-strtyp {sd}");
+
+            if (arguments.TryGetValue("extra_args", out var ea) && !string.IsNullOrWhiteSpace(ea?.ToString()))
+                sb.Append($" {ea}");
+
+            int timeoutMs = 120000;
+            if (arguments.TryGetValue("timeout_ms", out var to) && to is JsonElement toElem && toElem.TryGetInt32(out var toInt))
+                timeoutMs = Math.Max(5000, toInt);
+
+            // Run de4dot.exe
+            var psi = new ProcessStartInfo(de4dotExe, sb.ToString())
+            {
+                UseShellExecute        = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                CreateNoWindow         = true,
+                WorkingDirectory       = Path.GetDirectoryName(filePath) ?? Directory.GetCurrentDirectory()
+            };
+
+            var stdoutBuf = new StringBuilder();
+            var stderrBuf = new StringBuilder();
+
+            using var proc = new Process { StartInfo = psi };
+            proc.OutputDataReceived += (_, e) => { if (e.Data != null) stdoutBuf.AppendLine(e.Data); };
+            proc.ErrorDataReceived  += (_, e) => { if (e.Data != null) stderrBuf.AppendLine(e.Data); };
+
+            proc.Start();
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+
+            bool exited = proc.WaitForExit(timeoutMs);
+            if (!exited)
+            {
+                try { proc.Kill(); } catch { }
+                throw new TimeoutException($"de4dot timed out after {timeoutMs}ms");
+            }
+
+            bool success = proc.ExitCode == 0 && File.Exists(outputPath);
+            var result = JsonSerializer.Serialize(new
+            {
+                Success    = success,
+                ExitCode   = proc.ExitCode,
+                InputPath  = filePath,
+                OutputPath = success ? outputPath : (string?)null,
+                SizeBytes  = success ? (long?)new FileInfo(outputPath).Length : null,
+                Arguments  = sb.ToString(),
+                De4dotExe  = de4dotExe,
+                Stdout     = stdoutBuf.ToString().Trim(),
+                Stderr     = stderrBuf.ToString().Trim()
+            }, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            });
+
+            return new CallToolResult
+            {
+                Content  = new List<ToolContent> { new ToolContent { Text = result } },
+                IsError  = !success
+            };
+        }
+    }
+}
