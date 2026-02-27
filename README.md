@@ -2,7 +2,7 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedded in dnSpy that exposes full .NET assembly analysis, editing, debugging, memory-dump, and deobfuscation capabilities to any MCP-compatible AI assistant.
 
-**Version**: 1.4.0 | **Tools**: 85 | **Status**: ✅ 0 errors, 0 warnings | **Targets**: .NET 4.8 + .NET 10.0-windows
+**Version**: 1.5.0 | **Tools**: 87 | **Status**: ✅ 0 errors, 0 warnings | **Targets**: .NET 4.8 + .NET 10.0-windows
 
 ---
 
@@ -23,6 +23,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedd
    - [Memory Dump & PE Tools](#memory-dump--pe-tools)
    - [Static PE Analysis](#static-pe-analysis)
    - [Deobfuscation Tools](#deobfuscation-tools)
+   - [Window / Dialog Tools](#window--dialog-tools)
    - [Utility](#utility)
 5. [Pattern Syntax](#pattern-syntax)
 6. [Pagination](#pagination)
@@ -49,6 +50,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedd
 | **Memory Dump** | List runtime modules, dump .NET or native modules from memory, read process memory, extract PE sections |
 | **Static PE Analysis** | Scan raw PE bytes for strings; all-in-one ConfuserEx unpacker |
 | **Deobfuscation** | de4dot integration: detect obfuscator, rename mangled symbols, decrypt strings. Both in-process (`deobfuscate_assembly`) and external process (`run_de4dot`) modes available in all builds |
+| **Window / Dialog** | List active dialog/message-box windows (Win32 `#32770` + WPF) in the dnSpy process; dismiss them by clicking any button by name (supports EN and ES) |
 | **Search** | Glob and regex search across all loaded assemblies |
 
 ---
@@ -146,15 +148,24 @@ claude mcp add dnspy --transport sse http://localhost:3100/sse
   }
 }
 ```
+Or
+
+```json
+claude mcp add dnspy --transport sse http://localhost:3100/sse
+```
+
+
 
 ### OpenCode
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "dnspy": {
-      "type": "sse",
-      "url": "http://localhost:3100/sse"
+      "type": "remote",
+      "url": "http://localhost:3100/sse",
+      "enabled": true
     }
   }
 }
@@ -583,6 +594,39 @@ Two de4dot integration modes: **in-process** (`deobfuscate_assembly` — uses bu
 
 ---
 
+### Window / Dialog Tools
+
+Enumerate and dismiss dialog boxes (Win32 `MessageBox`, `#32770` dialogs, and WPF windows) that appear in the dnSpy process — for example, error popups that block a debug session. No debug session required.
+
+| Tool | Description | Required params | Optional params |
+|------|-------------|-----------------|-----------------|
+| `list_dialogs` | List all active dialog/message-box windows. Returns title, HWND (hex), message text, and available button labels for each | — | — |
+| `close_dialog` | Close a dialog by clicking a named button. Resolves the target by HWND or picks the first active dialog | — | `hwnd`, `button` |
+
+#### Parameter details
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `hwnd` | string | Hex HWND of the target dialog, as returned by `list_dialogs` (e.g. `"1A2B3C"`). If omitted, the first active dialog is used |
+| `button` | string | Button to click (case-insensitive, EN and ES): `ok`/`aceptar`, `yes`/`sí`, `no`, `cancel`/`cancelar`, `retry`/`reintentar`, `ignore`/`omitir`. Default: `ok` |
+
+> **Button matching** — the tool first checks common exact tokens (EN + ES), then falls back to substring matching. If no button matches, `WM_CLOSE` is sent to the dialog.
+
+#### Example
+
+```json
+// List all open dialogs
+{ "tool": "list_dialogs" }
+
+// Dismiss the first dialog by clicking OK
+{ "tool": "close_dialog" }
+
+// Dismiss a specific dialog by HWND, clicking Cancel
+{ "tool": "close_dialog", "arguments": { "hwnd": "1A2B3C", "button": "cancel" } }
+```
+
+---
+
 ### Utility
 
 | Tool | Description | Required params |
@@ -744,6 +788,19 @@ To fetch the next page, pass the `nextCursor` value as the `cursor` argument in 
 }}
 ```
 
+### Dismiss a dialog that is blocking a debug session
+
+```json
+{ "tool": "list_dialogs" }
+// → [1] Title: "Error de depuración"
+//       Hwnd: 1A2B3C  |  Type: Win32 (#32770)
+//       Message: "No se puede continuar la operación."
+//       Buttons: Aceptar, Cancelar
+
+{ "tool": "close_dialog", "arguments": { "hwnd": "1A2B3C", "button": "aceptar" } }
+// → Clicked 'Aceptar' in dialog 'Error de depuración'.
+```
+
 ### Find all callers and usages of a suspicious type
 
 ```json
@@ -777,6 +834,8 @@ To fetch the next page, pass the `nextCursor` value as the `cursor` argument in 
 | `src/Application/CodeAnalysisHelpers.cs` | Static call-graph, dependency chain, dead code analysis |
 | `src/Application/De4dotTools.cs` | de4dot in-process integration; available in all builds |
 | `src/Application/SkillsTools.cs` | Persistent skills knowledge base (Markdown + JSON) in `%APPDATA%\dnSpy\dnSpy.MCPServer\skills\` |
+| `src/Application/ScriptTools.cs` | Roslyn C# scripting (`run_script`) |
+| `src/Application/WindowTools.cs` | Win32 + WPF dialog enumeration and dismissal |
 | `src/Presentation/TheExtension.cs` | MEF entry point, server lifecycle |
 | `src/Contracts/McpProtocol.cs` | MCP DTOs (ToolInfo, CallToolResult, …) |
 
@@ -802,6 +861,8 @@ dnSpy.MCP.Server/
     │   ├── CodeAnalysisHelpers.cs   # Call-graph & dependency analysis
     │   ├── De4dotTools.cs           # de4dot deobfuscation (all builds)
     │   ├── SkillsTools.cs           # Skills knowledge base (MD + JSON)
+    │   ├── ScriptTools.cs           # Roslyn C# scripting
+    │   ├── WindowTools.cs           # Win32/WPF dialog management
     │   └── McpTools.cs              # Tool registry & routing
     ├── Communication/
     │   └── McpServer.cs             # HTTP/SSE server
@@ -861,6 +922,7 @@ netstat -ano | findstr :3100
 | `unpack_from_memory` fails with anti-debug error | Process kills itself before EntryPoint | Use `patch_method_to_ret` to neutralize anti-debug methods first, save the patched binary, then retry |
 | `Failed to reconnect` when adding MCP server | Wrong transport type | Use `--transport sse` with Claude Code CLI, not `streamable-http`. URL must point to `/sse` endpoint: `http://localhost:3100/sse` |
 | `dump_cordbg_il` returns E_NOINTERFACE errors | COM STA apartment threading | `ICorDebugModule` COM objects belong to the CorDebug engine thread; calling from another STA fails. This is a known limitation — use `dump_module_unpacked` instead for memory dumps. |
+| Debug session appears frozen / no response | A dialog box is blocking the UI thread | Call `list_dialogs` to detect open dialogs, then `close_dialog` to dismiss them and unblock the session. |
 
 ---
 

@@ -24,9 +24,9 @@ The dnSpy MCP Server implements a **Model Context Protocol (MCP)** server that e
 
 ---
 
-### 2. **McpTools.cs** (2,680 lines)
-**Responsibility**: MCP Command Implementations
-**Structure**: 35+ methods organized by command category
+### 2. **McpTools.cs**
+**Responsibility**: Central tool registry and command dispatcher
+**Structure**: Tool schemas + `ExecuteTool` switch routing to lazy-loaded service classes
 
 #### **Section A: Tool Registry & Dispatch** (Lines 40-633)
 - `GetAvailableTools()` - Schema definitions for all 30 commands
@@ -141,7 +141,23 @@ BuildTypeReferenceGraph(type)       // Complete type usage map
 
 ---
 
-### 6. **CodeAnalysisHelpers.cs** (Phase 5)
+### 7. **WindowTools.cs**
+**Responsibility**: Win32 and WPF dialog enumeration and dismissal
+**Methods**:
+- `ListDialogs()` — enumerate active dialog windows (Win32 `#32770` + WPF `Application.Current.Windows`). Collects title, HWND, message text (Static child controls), and button labels.
+- `CloseDialog(args)` — resolve target dialog by HWND (hex) or first found; send `BM_CLICK` to matching child button. Fallback: `WM_CLOSE`. For pure-WPF dialogs: `Dispatcher.Invoke(() => window.Close())`.
+
+**Implementation details**:
+- P/Invoke only: `EnumWindows`, `EnumChildWindows`, `GetWindowText`, `GetClassName`, `IsWindowVisible`, `GetWindowThreadProcessId`, `SendMessage`, `PostMessage`.
+- No dnSpy service dependencies — `[ImportingConstructor] WindowTools() { }`.
+- `WpfApp = System.Windows.Application` alias avoids namespace ambiguity with `dnSpy.MCP.Server.Application`.
+- Button matching: exact tokens EN + ES → substring fallback.
+
+**Status**: ✅ Production-ready
+
+---
+
+### 8. **CodeAnalysisHelpers.cs** (Phase 5)
 **Responsibility**: Advanced Code Analysis Infrastructure
 **Methods**:
 - `BuildCallGraph()` - Recursive method call graph analysis
@@ -211,6 +227,7 @@ McpTools.ExecuteTool(toolName, args)
 ├─ Lazy Delegation (Reflection)                  │
 │  ├─ InvokeLazy(assemblyTools, ...)            │
 │  ├─ InvokeLazy(typeTools, ...)                │
+│  ├─ InvokeLazy(windowTools, ...)             │
 │  └─ CallInterop(...)                          │
 │                                                 │
 └─────────────────────────────────────────────────┘
@@ -284,7 +301,8 @@ Methods requiring interop features (P/Invoke, marshalling) are delegated to `Mcp
 | Hook Suggestion | suggest_hook_points, get_constant_values | ✅ | ~150 |
 | Path Finding | find_path_to_type, find_type_references | ✅ | ~200 |
 | **Phase 4: Usage Finding** | **find_who_uses_type, find_who_calls_method, find_who_reads_field, find_who_writes_field** | ✅ | **~400** |
-| **Phase 5: Code Analysis** | **analyze_call_graph, find_dependency_chain, find_exposed_interfaces, trace_data_flow, find_dead_code, analyze_cross_assembly_dependencies** | ✅ | **~350** |
+| **Phase 5: Code Analysis** | **analyze_call_graph, find_dependency_chain, find_dead_code, analyze_cross_assembly_dependencies** | ✅ | **~350** |
+| **Window / Dialog** | **list_dialogs, close_dialog** | ✅ | **~300** |
 
 ---
 
@@ -361,7 +379,7 @@ Methods requiring interop features (P/Invoke, marshalling) are delegated to `Mcp
 dnSpy.MCP.Server/
 ├─ src/
 │  ├─ Presentation/   # Integracion (UI, menús)
-│  ├─ Application/    # Command handlers
+│  ├─ Application/    # Command handlers (AssemblyTools, TypeTools, EditTools, DebugTools, DumpTools, MemoryInspectTools, UsageFindingCommandTools, CodeAnalysisHelpers, De4dotTools, SkillsTools, ScriptTools, WindowTools, McpTools)
 │  ├─ Core/           # Modelos + interfaces (dominio)
 │  ├─ Communication/  # JSON-RPC + MCP transport (stdio/ws)
 │  ├─ Helper/         # Utilidades transversales
@@ -375,7 +393,7 @@ dnSpy.MCP.Server/
 ---
 
 ## Document Version
-- **Version**: 1.1
-- **Updated**: 2025-11-03
-- **Status**: Architecture documented for Phase 5 completion (100% implementation) - Production Ready
+- **Version**: 1.5
+- **Updated**: 2026-02-27
+- **Status**: Architecture documented for v1.5.0 — 87 tools, production ready
 

@@ -2,6 +2,27 @@
 
 ---
 
+## v1.5.0 — 2026-02-27
+
+### New: Window / Dialog Management Tools
+
+Two new tools that let MCP clients detect and dismiss dialog boxes (error popups, confirmation dialogs) that appear inside the dnSpy process — previously impossible without direct UI interaction. Especially useful when a debug operation triggers an error MessageBox that freezes the session.
+
+| Tool | Description |
+|------|-------------|
+| `list_dialogs` | Enumerate all active dialog/message-box windows (Win32 `#32770` + WPF). Returns title, HWND, message text, and button labels |
+| `close_dialog` | Click a button on a dialog by name (EN/ES). Defaults to the first dialog and the OK button |
+
+**Button matching** (case-insensitive): `ok`/`aceptar`, `yes`/`sí`, `no`, `cancel`/`cancelar`, `retry`/`reintentar`, `ignore`/`omitir`. Falls back to `WM_CLOSE` if no button matches.
+
+### Implementation
+- New file: `src/Application/WindowTools.cs` — P/Invoke only (`EnumWindows`, `EnumChildWindows`, `SendMessage`, `PostMessage`). No dnSpy service dependencies.
+- `McpTools.cs` updated: field, constructor parameter, schema, and dispatch for both tools.
+
+### Total tools: **87**
+
+---
+
 ## v1.2.0 — 2026-02-24
 
 ### New: Memory Dump Tools

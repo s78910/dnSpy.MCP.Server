@@ -71,6 +71,10 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3" />
     <PackageReference Include="Microsoft.VisualStudio.Text.UI.Wpf" Version="$(MSVSTextVersion)" />
     <PackageReference Include="ModelContextProtocol" Version="0.9.0-preview.2" />
+    <!-- Roslyn scripting — compile-time reference only; DLL already ships with dnSpy -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Scripting" Version="5.0.0">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
   </ItemGroup>
 
   <!-- For .NET Framework 4.8, we'll use a simpler HTTP listener approach -->
@@ -78,12 +82,15 @@
     <PackageReference Include="Newtonsoft.Json" Version="$(NewtonsoftJsonVersion)" />
   </ItemGroup>
 
-  <!-- Exclude backup and docs directories from implicit SDK compile items -->
+  <!-- Exclude backup, docs, and Sample directories from implicit SDK compile items -->
   <ItemGroup>
     <Compile Remove="backup\**\*.cs" />
     <None Remove="backup\**\*.xaml" />
     <Compile Remove="docs\**\*.cs" />
     <None Remove="docs\**\*.xaml" />
+    <Compile Remove="Sample\**\*.cs" />
+    <None Remove="Sample\**\*.xaml" />
+    <Page Remove="Sample\**\*.xaml" />
   </ItemGroup>
 
   <!-- Config file deployed alongside the DLL — user edits are preserved on rebuild -->

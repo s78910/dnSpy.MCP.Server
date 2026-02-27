@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-02-27
+
+### Added
+- **Window / Dialog management tools** (2 new tools — `WindowTools.cs`):
+  - `list_dialogs` — enumerate active dialog/message-box windows in the dnSpy process (Win32 `#32770` class + WPF windows). Returns title, HWND, message text, and button labels for each dialog.
+  - `close_dialog` — dismiss a dialog by clicking a named button. Supports EN and ES button names (`ok`/`aceptar`, `yes`/`sí`, `no`, `cancel`/`cancelar`, `retry`/`reintentar`, `ignore`/`omitir`). Falls back to `WM_CLOSE` if no button matches. Target resolved by HWND or defaults to the first active dialog.
+
+### Implementation notes
+- `WindowTools` has no dnSpy service dependencies (only P/Invoke + `System.Windows.Application`).
+- Uses `EnumWindows` for Win32 dialogs and `Application.Current.Windows` for WPF dialogs.
+- `WpfApp = System.Windows.Application` alias used to avoid namespace ambiguity inside `dnSpy.MCP.Server.Application`.
+
+### Total tools: **87** (was 85)
+
+---
+
 ## [1.2.0] - 2026-02-24
 
 ### Added

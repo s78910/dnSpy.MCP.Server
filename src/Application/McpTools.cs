@@ -51,6 +51,8 @@ namespace dnSpy.MCP.Server.Application
         readonly Lazy<De4dotExeTool> de4dotExeTool;
         readonly Lazy<De4dotTools> de4dotTools;
         readonly Lazy<SkillsTools> skillsTools;
+        readonly Lazy<ScriptTools> scriptTools;
+        readonly Lazy<WindowTools> windowTools;
 
         [ImportingConstructor]
         public McpTools(
@@ -66,7 +68,9 @@ namespace dnSpy.MCP.Server.Application
             Lazy<CodeAnalysisHelpers> codeAnalysisTools,
             Lazy<De4dotExeTool> de4dotExeTool,
             Lazy<De4dotTools> de4dotTools,
-            Lazy<SkillsTools> skillsTools
+            Lazy<SkillsTools> skillsTools,
+            Lazy<ScriptTools> scriptTools,
+            Lazy<WindowTools> windowTools
             )
         {
             this.documentTreeView = documentTreeView;
@@ -82,6 +86,8 @@ namespace dnSpy.MCP.Server.Application
             this.de4dotExeTool = de4dotExeTool;
             this.de4dotTools = de4dotTools;
             this.skillsTools = skillsTools;
+            this.scriptTools = scriptTools;
+            this.windowTools = windowTools;
         }
 
         public List<ToolInfo> GetAvailableTools()
@@ -1289,6 +1295,64 @@ namespace dnSpy.MCP.Server.Application
                         },
                         ["required"] = new List<string> { "skill_id" }
                     }
+                },
+                new ToolInfo {
+                    Name = "run_script",
+                    Description = "Execute arbitrary C# code via Roslyn inside dnSpy's process. " +
+                        "Globals available in scripts: `module` (ModuleDef? — currently selected assembly, or null), " +
+                        "`allModules` (IReadOnlyList<ModuleDef> — all loaded assemblies), " +
+                        "`docService` (IDsDocumentService), `dbgManager` (DbgManager? — null when no debug session), " +
+                        "`print(value)` / `print(fmt, args)` — capture output lines. " +
+                        "Pre-imported namespaces: System, System.Linq, System.IO, System.Text, System.Collections.Generic, " +
+                        "System.Reflection, dnlib.DotNet, dnlib.DotNet.Emit, dnlib.DotNet.Writer. " +
+                        "Return value (if any) is appended to output as 'Return: <value>'.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["code"] = new Dictionary<string, object> {
+                                ["type"] = "string",
+                                ["description"] = "C# code to execute inside dnSpy's process. Has full access to all dnSpy APIs and loaded assemblies."
+                            },
+                            ["timeout_seconds"] = new Dictionary<string, object> {
+                                ["type"] = "integer",
+                                ["description"] = "Maximum execution time in seconds. Default: 30."
+                            }
+                        },
+                        ["required"] = new List<string> { "code" }
+                    }
+                },
+
+                // ── Window / Dialog management ────────────────────────────────────────
+                new ToolInfo {
+                    Name = "list_dialogs",
+                    Description = "List active dialog/message-box windows in the dnSpy process. " +
+                        "Returns title, HWND, message text and available button labels for each dialog.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object>(),
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "close_dialog",
+                    Description = "Close a dialog/message-box window by clicking a button. " +
+                        "If no HWND given, closes the first active dialog found. " +
+                        "Button matching is case-insensitive and supports English and Spanish: " +
+                        "ok/aceptar, yes/sí, no, cancel/cancelar, retry/reintentar, ignore/omitir.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["hwnd"] = new Dictionary<string, object> {
+                                ["type"] = "string",
+                                ["description"] = "Hex HWND of specific dialog (from list_dialogs). Optional."
+                            },
+                            ["button"] = new Dictionary<string, object> {
+                                ["type"] = "string",
+                                ["description"] = "Button to click: ok (default), yes, no, cancel, retry, ignore."
+                            }
+                        },
+                        ["required"] = new List<string>()
+                    }
                 }
             };
         }
@@ -1413,6 +1477,13 @@ namespace dnSpy.MCP.Server.Application
                     "save_skill"    => InvokeLazy(skillsTools, "SaveSkill",    arguments),
                     "search_skills" => InvokeLazy(skillsTools, "SearchSkills", arguments),
                     "delete_skill"  => InvokeLazy(skillsTools, "DeleteSkill",  arguments),
+
+                    // Roslyn scripting
+                    "run_script" => InvokeLazy(scriptTools, "RunScript", arguments),
+
+                    // Window / dialog management
+                    "list_dialogs" => InvokeLazy(windowTools, "ListDialogs", arguments),
+                    "close_dialog" => InvokeLazy(windowTools, "CloseDialog", arguments),
 
                     _ => new CallToolResult
                     {
