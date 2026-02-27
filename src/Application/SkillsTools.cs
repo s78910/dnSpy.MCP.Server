@@ -135,7 +135,7 @@ namespace dnSpy.MCP.Server.Application {
 			var summaries = LoadAllSummaries();
 
 			if (!string.IsNullOrEmpty(tagFilter)) {
-				var tf = tagFilter.ToLowerInvariant();
+				var tf = tagFilter!.ToLowerInvariant();
 				summaries = summaries
 					.Where(s => s.Tags.Any(t => t.ToLowerInvariant().Contains(tf)))
 					.ToList();
@@ -309,14 +309,14 @@ namespace dnSpy.MCP.Server.Application {
 			foreach (var s in summaries) {
 				// Tag filter
 				if (!string.IsNullOrEmpty(tagFilter)) {
-					var tf = tagFilter.ToLowerInvariant();
+					var tf = tagFilter!.ToLowerInvariant();
 					if (!s.Tags.Any(t => t.ToLowerInvariant().Contains(tf)))
 						continue;
 				}
 
 				string? snippet = null;
 				if (!string.IsNullOrWhiteSpace(query)) {
-					var q = query.ToLowerInvariant();
+					var q = query!.ToLowerInvariant();
 					// Search markdown
 					if (File.Exists(s.MdFile)) {
 						var md = File.ReadAllText(s.MdFile, Encoding.UTF8);

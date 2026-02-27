@@ -22,29 +22,47 @@
   <!-- de4dot integration (deobfuscation engine) — DLLs bundled in libs/ -->
   <!-- net48 build uses libs/de4dot/ (net48 DLLs) -->
   <!-- net10 build uses libs/de4dot-net8/ (net8 DLLs, compatible with net10) -->
-  <PropertyGroup>
-    <De4DotBin Condition=" '$(IsDotNetFramework)' == 'true' ">$(MSBuildThisFileDirectory)libs\de4dot</De4DotBin>
-    <De4DotBin Condition=" '$(IsDotNetFramework)' != 'true' ">$(MSBuildThisFileDirectory)libs\de4dot-net8</De4DotBin>
-  </PropertyGroup>
-  <ItemGroup>
+  <ItemGroup Condition=" '$(TargetFramework)' == 'net48' ">
     <Reference Include="de4dot.code">
-      <HintPath>$(De4DotBin)\de4dot.code.dll</HintPath>
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot\de4dot.code.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="de4dot.blocks">
-      <HintPath>$(De4DotBin)\de4dot.blocks.dll</HintPath>
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot\de4dot.blocks.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="de4dot.mdecrypt">
-      <HintPath>$(De4DotBin)\de4dot.mdecrypt.dll</HintPath>
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot\de4dot.mdecrypt.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="de4dot.cui">
-      <HintPath>$(De4DotBin)\de4dot.cui.dll</HintPath>
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot\de4dot.cui.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="AssemblyData">
-      <HintPath>$(De4DotBin)\AssemblyData.dll</HintPath>
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot\AssemblyData.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup Condition=" '$(TargetFramework)' != 'net48' ">
+    <Reference Include="de4dot.code">
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot-net8\de4dot.code.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="de4dot.blocks">
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot-net8\de4dot.blocks.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="de4dot.mdecrypt">
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot-net8\de4dot.mdecrypt.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="de4dot.cui">
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot-net8\de4dot.cui.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="AssemblyData">
+      <HintPath>$(MSBuildThisFileDirectory)libs\de4dot-net8\AssemblyData.dll</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>

@@ -201,7 +201,7 @@ namespace dnSpy.MCP.Server.Application
             if (arguments != null && arguments.TryGetValue("output_path", out var outObj) &&
                 !string.IsNullOrEmpty(outObj?.ToString()))
             {
-                outputPath = outObj.ToString()!;
+                outputPath = outObj!.ToString()!;
             }
             else
             {
@@ -355,7 +355,7 @@ namespace dnSpy.MCP.Server.Application
                 string.IsNullOrEmpty(obj?.ToString()))
                 throw new ArgumentException($"{key} is required");
 
-            var path = obj.ToString()!;
+            var path = obj!.ToString()!;
             if (!File.Exists(path))
                 throw new ArgumentException($"File not found: {path}");
             return path;
@@ -424,7 +424,7 @@ namespace dnSpy.MCP.Server.Application
 
             string outputPath = filePath + ".deobfuscated.exe";
             if (arguments.TryGetValue("output_path", out var op) && !string.IsNullOrWhiteSpace(op?.ToString()))
-                outputPath = op.ToString()!;
+                outputPath = op!.ToString()!;
 
             var outDir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(outDir)) Directory.CreateDirectory(outDir);

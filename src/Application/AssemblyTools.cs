@@ -713,7 +713,7 @@ namespace dnSpy.MCP.Server.Application
                 }
                 catch { }
 
-                return new { Selected = true, OpenedTab = openedTab, Error = (string?)null };
+                return new { Selected = true, OpenedTab = openedTab, Error = (string)null! };
             });
 
             var response = new
