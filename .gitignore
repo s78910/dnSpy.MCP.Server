@@ -2,9 +2,9 @@
 bin/
 obj/
 json/
-*.dll
+#*.dll
 *.pdb
-*.exe
+#*.exe
 
 # IDE and editor files
 .vs/
