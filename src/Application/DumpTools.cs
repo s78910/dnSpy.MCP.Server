@@ -301,6 +301,74 @@ namespace dnSpy.MCP.Server.Application {
 			};
 		}
 
+		// ── write_process_memory ─────────────────────────────────────────────────
+
+		/// <summary>
+		/// Write bytes to a debugged process address (hot-patching). Requires an active debug session.
+		/// Arguments: address (hex/decimal string), bytes_base64 OR hex_bytes (required),
+		///            process_id (optional int)
+		/// </summary>
+		public CallToolResult WriteProcessMemory(Dictionary<string, object>? arguments) {
+			if (arguments == null)
+				throw new ArgumentException("Arguments required");
+			if (!arguments.TryGetValue("address", out var addressObj))
+				throw new ArgumentException("address is required");
+
+			var addressStr = (addressObj?.ToString() ?? string.Empty).Trim();
+			if (!TryParseAddress(addressStr, out ulong address))
+				throw new ArgumentException($"Invalid address '{addressStr}'. Use hex (0x7FF000) or decimal.");
+
+			byte[] bytes;
+			if (arguments.TryGetValue("bytes_base64", out var b64Obj)) {
+				var b64 = b64Obj?.ToString() ?? "";
+				try { bytes = Convert.FromBase64String(b64); }
+				catch { throw new ArgumentException("bytes_base64 is not valid base64."); }
+			}
+			else if (arguments.TryGetValue("hex_bytes", out var hexObj)) {
+				bytes = ParseHexBytes(hexObj?.ToString() ?? "");
+			}
+			else {
+				throw new ArgumentException("Either bytes_base64 or hex_bytes is required.");
+			}
+
+			if (bytes.Length == 0)
+				throw new ArgumentException("Byte array must not be empty.");
+			if (bytes.Length > 65536)
+				throw new ArgumentException($"Byte array too large ({bytes.Length} bytes); max 65536.");
+
+			int? filterPid = null;
+			if (arguments.TryGetValue("process_id", out var pidObj) && pidObj is JsonElement pidElem && pidElem.TryGetInt32(out var pidInt))
+				filterPid = pidInt;
+
+			var mgr = dbgManager.Value;
+			if (!mgr.IsDebugging)
+				throw new InvalidOperationException("Debugger is not active.");
+
+			DbgProcess? process = null;
+			if (filterPid.HasValue)
+				process = mgr.Processes.FirstOrDefault(p => p.Id == filterPid.Value);
+			else
+				process = mgr.Processes.FirstOrDefault(p => p.State == DbgProcessState.Paused)
+					?? mgr.Processes.FirstOrDefault();
+
+			if (process == null)
+				throw new InvalidOperationException("No debugged process found.");
+
+			process.WriteMemory(address, bytes);
+
+			var json = JsonSerializer.Serialize(new {
+				ProcessId    = process.Id,
+				ProcessName  = process.Name,
+				Address      = $"0x{address:X16}",
+				BytesWritten = bytes.Length,
+				Note         = "Memory write completed. Use read_process_memory to verify."
+			}, new JsonSerializerOptions { WriteIndented = true });
+
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = json } }
+			};
+		}
+
 		// ── get_pe_sections ──────────────────────────────────────────────────────
 
 		/// <summary>
@@ -831,6 +899,20 @@ namespace dnSpy.MCP.Server.Application {
 				"^" + escaped + "$",
 				System.Text.RegularExpressions.RegexOptions.IgnoreCase |
 				System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+		}
+
+		static byte[] ParseHexBytes(string hex) {
+			// Accept "90 90 FF", "9090FF", "0x90, 0x90", "90-90-FF", etc.
+			// net48: Replace(string, string, StringComparison) not available — strip both cases
+			hex = hex
+				.Replace("0x", "").Replace("0X", "")
+				.Replace(" ", "").Replace(",", "").Replace("-", "");
+			if (hex.Length % 2 != 0)
+				throw new ArgumentException($"hex_bytes has odd length after normalization: '{hex}'");
+			var result = new byte[hex.Length / 2];
+			for (int i = 0; i < result.Length; i++)
+				result[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+			return result;
 		}
 
 		static bool TryParseAddress(string s, out ulong value) {

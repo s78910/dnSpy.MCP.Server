@@ -185,7 +185,7 @@ namespace dnSpy.MCP.Server.Communication {
 				// Enable CORS
 				context.Response.AddHeader("Access-Control-Allow-Origin", "*");
 				context.Response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-				context.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+				context.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization");
 
 				if (context.Request.HttpMethod == "OPTIONS") {
 					context.Response.StatusCode = 200;
@@ -194,6 +194,17 @@ namespace dnSpy.MCP.Server.Communication {
 				}
 
 				var path = context.Request.Url?.AbsolutePath ?? "/";
+
+				if (path != "/health" && !IsRequestAuthorized(context.Request)) {
+					context.Response.StatusCode = 401;
+					context.Response.AddHeader("WWW-Authenticate", "Bearer");
+					var authMsg = Encoding.UTF8.GetBytes("{\"error\":\"Unauthorized\"}");
+					context.Response.ContentType = "application/json";
+					context.Response.ContentLength64 = authMsg.Length;
+					context.Response.OutputStream.Write(authMsg, 0, authMsg.Length);
+					context.Response.Close();
+					return;
+				}
 
 						// SSE stream: GET /sse, /events, or /
 				if (context.Request.HttpMethod == "GET" && (path == "/sse" || path == "/events" || path == "/")) {
@@ -277,6 +288,17 @@ namespace dnSpy.MCP.Server.Communication {
 					// best-effort
 				}
 			}
+		}
+
+		bool IsRequestAuthorized(HttpListenerRequest req) {
+			var cfg = Configuration.McpConfig.Instance;
+			if (!cfg.RequireApiKey || string.IsNullOrEmpty(cfg.ApiKey)) return true;
+			var key = req.Headers["X-API-Key"];
+			if (key == cfg.ApiKey) return true;
+			var auth = req.Headers["Authorization"];
+			if (auth != null && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+				&& auth.Substring(7) == cfg.ApiKey) return true;
+			return false;
 		}
 
 		/// <summary>

@@ -52,6 +52,21 @@ namespace dnSpy.MCP.Server.Configuration
         [JsonPropertyName("de4dotSearchPaths")]
         public List<string> De4dotSearchPaths { get; set; } = new List<string>();
 
+        /// <summary>If true, all requests must include X-API-Key or Authorization: Bearer <ApiKey>.</summary>
+        [JsonPropertyName("requireApiKey")]
+        public bool RequireApiKey { get; set; } = false;
+
+        /// <summary>API key value. Generate with: openssl rand -hex 32</summary>
+        [JsonPropertyName("apiKey")]
+        public string ApiKey { get; set; } = "";
+
+        /// <summary>
+        /// Enables the run_script tool. Default false — disable when analyzing malware.
+        /// Set to true only in trusted environments.
+        /// </summary>
+        [JsonPropertyName("enableRunScript")]
+        public bool EnableRunScript { get; set; } = true;
+
         // ── Singleton ─────────────────────────────────────────────────────────
 
         public static McpConfig Instance

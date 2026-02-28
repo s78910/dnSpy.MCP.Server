@@ -27,6 +27,8 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 using de4dot.code;
 using de4dot.code.AssemblyClient;
@@ -240,6 +242,13 @@ namespace dnSpy.MCP.Server.Application
                 };
             }
 
+            int timeoutSeconds = 120;
+            if (arguments != null && arguments.TryGetValue("timeout_seconds", out var tso))
+            {
+                if (tso is JsonElement je && je.TryGetInt32(out var ti)) timeoutSeconds = Math.Max(10, ti);
+                else if (int.TryParse(tso?.ToString(), out var ti2)) timeoutSeconds = Math.Max(10, ti2);
+            }
+
             // Capture de4dot log output via Console.Out redirect
             var logSb = new StringBuilder();
             var oldOut = Console.Out;
@@ -273,13 +282,23 @@ namespace dnSpy.MCP.Server.Application
                 var deob = obfFile.Deobfuscator;
                 string detectedName = deob.TypeLong;
 
-                obfFile.DeobfuscateBegin();
-                obfFile.Deobfuscate();
-                obfFile.DeobfuscateEnd();
+                using var deobfCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+                var deobfTask = Task.Run(() =>
+                {
+                    obfFile.DeobfuscateBegin();
+                    obfFile.Deobfuscate();
+                    obfFile.DeobfuscateEnd();
+                    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+                    obfFile.Save();
+                }, deobfCts.Token);
 
-                // Save output
-                Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-                obfFile.Save();
+                if (!deobfTask.Wait(TimeSpan.FromSeconds(timeoutSeconds)))
+                {
+                    deobfCts.Cancel();
+                    throw new TimeoutException($"deobfuscate_assembly timed out after {timeoutSeconds}s");
+                }
+                // Re-throw any exception from the task
+                deobfTask.GetAwaiter().GetResult();
 
                 try { TheAssemblyResolver.Instance.Remove(obfFile.ModuleDefMD); } catch { }
                 obfFile.Dispose();

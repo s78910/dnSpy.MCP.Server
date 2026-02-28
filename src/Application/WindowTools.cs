@@ -52,6 +52,9 @@ namespace dnSpy.MCP.Server.Application
         static extern bool IsWindowVisible(IntPtr h);
 
         [DllImport("user32.dll")]
+        static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
         static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 
         [DllImport("user32.dll")]
@@ -155,7 +158,7 @@ namespace dnSpy.MCP.Server.Application
                     {
                         var interop = new System.Windows.Interop.WindowInteropHelper(w);
                         IntPtr h = interop.Handle;
-                        if (h != IntPtr.Zero)
+                        if (h != IntPtr.Zero && IsWindow(h))
                         {
                             di.Hwnd = h;
                             di.Message = GetDialogMessage(h);
@@ -271,6 +274,9 @@ namespace dnSpy.MCP.Server.Application
             // Click matching button on Win32 dialog
             if (target.Hwnd != IntPtr.Zero)
             {
+                if (!IsWindow(target.Hwnd))
+                    return $"Error: HWND {target.Hwnd.ToInt64():X} is no longer valid (window already closed).";
+
                 var buttons = GetButtons(target.Hwnd);
                 IntPtr matchedBtn = IntPtr.Zero;
                 string matchedText = "";

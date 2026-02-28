@@ -183,6 +183,124 @@ namespace dnSpy.MCP.Server.Application {
 
 		// ── Helpers ──────────────────────────────────────────────────────────────
 
+	// ── eval_expression ──────────────────────────────────────────────────────
+
+	/// <summary>
+	/// Evaluates a C# expression in the context of the current paused stack frame.
+	/// Equivalent to the Watch window in dnSpy. Requires debugger to be paused.
+	/// Arguments: expression* (C# string), frame_index (int, optional, default=0),
+	///            process_id (int, optional), func_eval_timeout_seconds (int, optional, default=5)
+	/// </summary>
+	public CallToolResult EvalExpression(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("expression", out var exprObj))
+			throw new ArgumentException("expression is required");
+		var expression = exprObj?.ToString() ?? "";
+
+		var mgr = dbgManager.Value;
+		if (!mgr.IsDebugging)
+			throw new InvalidOperationException("Debugger is not active. Start a debug session first.");
+
+		int frameIndex = 0;
+		if (arguments.TryGetValue("frame_index", out var fiObj)) {
+			if (fiObj is JsonElement fiElem) fiElem.TryGetInt32(out frameIndex);
+			else int.TryParse(fiObj?.ToString(), out frameIndex);
+		}
+
+		int? filterPid = null;
+		if (arguments.TryGetValue("process_id", out var pidObj2) &&
+			pidObj2 is JsonElement pidElem2 && pidElem2.TryGetInt32(out var pidInt))
+			filterPid = pidInt;
+
+		int funcEvalTimeout = 5;
+		if (arguments.TryGetValue("func_eval_timeout_seconds", out var tsoObj)) {
+			if (tsoObj is JsonElement tsoElem && tsoElem.TryGetInt32(out var tso)) funcEvalTimeout = Math.Max(1, tso);
+			else if (int.TryParse(tsoObj?.ToString(), out var tso2)) funcEvalTimeout = Math.Max(1, tso2);
+		}
+
+		return System.Windows.Application.Current.Dispatcher.Invoke(() => {
+			var process = filterPid.HasValue
+				? mgr.Processes.FirstOrDefault(p => p.Id == filterPid.Value)
+				: mgr.Processes.FirstOrDefault(p => p.State == DbgProcessState.Paused)
+				  ?? mgr.Processes.FirstOrDefault();
+
+			if (process == null)
+				throw new InvalidOperationException("No debugged process found.");
+			if (process.State != DbgProcessState.Paused)
+				throw new InvalidOperationException(
+					$"Process {process.Id} is not paused. Use break_debugger or wait for a breakpoint.");
+
+			var thread = process.Threads.FirstOrDefault(t => t.GetTopStackFrame() != null)
+			             ?? process.Threads.FirstOrDefault();
+			if (thread == null)
+				throw new InvalidOperationException("No threads found in the process.");
+
+			var frames = thread.GetFrames(frameIndex + 1);
+			if (frames.Length <= frameIndex)
+				throw new ArgumentException(
+					$"frame_index {frameIndex} out of range ({frames.Length} frames available).");
+
+			var frame = frames[frameIndex];
+			var runtime = frame.Runtime;
+			var language = languageService.Value.GetCurrentLanguage(runtime.RuntimeKindGuid);
+			DbgEvaluationContext? context = null;
+			try {
+				context = language.CreateContext(runtime, frame.Location,
+					DbgEvaluationContextOptions.None,
+					TimeSpan.FromSeconds(funcEvalTimeout));
+
+				var evalInfo = new DbgEvaluationInfo(context, frame);
+				var evalResult = language.ExpressionEvaluator.Evaluate(
+					evalInfo, expression, DbgEvaluationOptions.Expression, null);
+
+				if (evalResult.Error != null) {
+					var errJson = JsonSerializer.Serialize(new {
+						Expression = expression,
+						Error = evalResult.Error,
+						IsThrownException = evalResult.IsThrownException
+					}, new JsonSerializerOptions { WriteIndented = true });
+					return new CallToolResult {
+						Content = new List<ToolContent> { new ToolContent { Text = errJson } },
+						IsError = true
+					};
+				}
+
+				var resultJson = JsonSerializer.Serialize(new {
+					Expression        = expression,
+					Value             = FormatDbgValue(evalResult.Value),
+					IsThrownException = evalResult.IsThrownException,
+					HasSideEffects    = (evalResult.Flags & DbgEvaluationResultFlags.SideEffects) != 0
+				}, new JsonSerializerOptions {
+					WriteIndented = true,
+					DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault
+				});
+				evalResult.Value?.Close();
+				return new CallToolResult {
+					Content = new List<ToolContent> { new ToolContent { Text = resultJson } }
+				};
+			}
+			finally {
+				context?.Close();
+				foreach (var f in frames) f.Close();
+			}
+		});
+	}
+
+	static object FormatDbgValue(DbgValue? value) {
+		if (value == null)
+			return new { Kind = "null" };
+		if (value.HasRawValue && value.ValueType != DbgSimpleValueType.Other) {
+			if (value.ValueType == DbgSimpleValueType.StringUtf16)
+				return new { Kind = "String", Value = (object?)(value.RawValue as string ?? "null") };
+			return new { Kind = value.ValueType.ToString(), Value = (object?)(value.RawValue?.ToString() ?? "null") };
+		}
+		var addr = value.GetRawAddressValue(onlyDataAddress: false);
+		if (addr.HasValue)
+			return new { Kind = "Object", Address = $"0x{addr.Value.Address:X16}", SizeBytes = addr.Value.Length };
+		return new { Kind = "Unknown" };
+	}
+
 		static object FormatValueResult(DbgDotNetValueResult result, DbgProcess process) {
 			if (result.HasError)
 				return new { Error = result.ErrorMessage ?? "Unknown error" };

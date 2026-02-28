@@ -2,6 +2,50 @@
 
 ---
 
+## v1.6.0 — 2026-02-27
+
+### New: Active Debug Stepping, Expression Evaluation & Memory Patching
+
+Seven new tools and one extended tool that complete the runtime inspection workflow — the AI can now drive single-step execution, inspect arbitrary expressions, and hot-patch memory without stopping the session.
+
+#### Debug Stepping (5 new tools)
+
+| Tool | Description |
+|------|-------------|
+| `step_over` | Step over the current statement. Blocks until `StepComplete` fires (default 30 s timeout). Returns the new execution location. |
+| `step_into` | Step into the called method. Same blocking behaviour. |
+| `step_out` | Run until the current method returns to its caller. |
+| `get_current_location` | Read the top-frame location (token, IL offset, module name) without stepping. Read-only, no side-effects. |
+| `wait_for_pause` | Poll every 100 ms until any process becomes paused — useful after `continue_debugger` + breakpoint, or `start_debugging` before the first pause. |
+
+All step tools accept optional `thread_id`, `process_id`, and `timeout_seconds`. Thread resolution: explicit `thread_id` → current thread → first paused thread.
+
+#### Expression Evaluation (1 new tool)
+
+| Tool | Description |
+|------|-------------|
+| `eval_expression` | Evaluate a C# expression in the current paused stack frame context. Equivalent to the Watch window in dnSpy. Returns typed value: primitive, string, or object address + size. Configurable `func_eval_timeout_seconds`. |
+
+#### Live Memory Patching (1 new tool)
+
+| Tool | Description |
+|------|-------------|
+| `write_process_memory` | Write bytes to a process address (`DbgProcess.WriteMemory`). Accepts `bytes_base64` (base64) or `hex_bytes` (`"90 90 C3"`, `"9090C3"`, `"0x90 0x90"`). Hot-patches without touching the binary on disk. |
+
+#### Conditional Breakpoints (extended existing tool)
+
+`set_breakpoint` now accepts an optional `condition` parameter. The breakpoint only fires when the C# expression evaluates to `true`, eliminating manual `continue` loops.
+
+### Implementation
+- Stepping: `DbgStepper.Step(kind)` on WPF Dispatcher + `ManualResetEventSlim` for cross-thread synchronisation.
+- Eval: `DbgLanguage.ExpressionEvaluator.Evaluate()` + `FormatDbgValue()` helper for `DbgValue` base API.
+- Write memory: `DbgProcess.WriteMemory(ulong, byte[])`.
+- `ParseHexBytes` handles `0x`/`0X` prefixes and separators; net48-compatible.
+
+### Total tools: **95**
+
+---
+
 ## v1.5.0 — 2026-02-27
 
 ### New: Window / Dialog Management Tools

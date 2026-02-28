@@ -80,6 +80,10 @@ namespace dnSpy.MCP.Server.Application
         // ─────────────────────────────────────────────────────────────────────
         public string RunScript(Dictionary<string, object>? args)
         {
+            if (!Configuration.McpConfig.Instance.EnableRunScript)
+                throw new InvalidOperationException(
+                    "run_script is disabled. Set \"enableRunScript\": true in mcp-config.json to enable.");
+
             string? code = null;
             if (args != null && args.TryGetValue("code", out var codeVal))
                 code = codeVal?.ToString();

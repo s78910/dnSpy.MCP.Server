@@ -2,7 +2,7 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedded in dnSpy that exposes full .NET assembly analysis, editing, debugging, memory-dump, and deobfuscation capabilities to any MCP-compatible AI assistant.
 
-**Version**: 1.5.0 | **Tools**: 87 | **Status**: ✅ 0 errors, 0 warnings | **Targets**: .NET 4.8 + .NET 10.0-windows
+**Version**: 1.6.0 | **Tools**: 95 | **Status**: ✅ 0 errors, 0 warnings | **Targets**: .NET 4.8 + .NET 10.0-windows
 
 ---
 
@@ -46,8 +46,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedd
 | **Analysis** | Find callers/users, trace field reads/writes, call graphs, dead code, cross-assembly dependencies |
 | **Edit** | Rename members, change access modifiers, edit metadata, patch methods, inject types, save to disk |
 | **Resources** | List, read, add, remove embedded resources (ManifestResource table); extract Costura.Fody-embedded assemblies |
-| **Debug** | Manage breakpoints, launch/attach processes, pause/resume/stop sessions, inspect call stacks, read locals |
-| **Memory Dump** | List runtime modules, dump .NET or native modules from memory, read process memory, extract PE sections |
+| **Debug** | Manage breakpoints (with conditions), launch/attach processes, pause/resume/stop sessions, single-step (over/into/out), inspect call stacks, read locals, evaluate expressions |
+| **Memory Dump** | List runtime modules, dump .NET or native modules from memory, read/write process memory, extract PE sections |
 | **Static PE Analysis** | Scan raw PE bytes for strings; all-in-one ConfuserEx unpacker |
 | **Deobfuscation** | de4dot integration: detect obfuscator, rename mangled symbols, decrypt strings. Both in-process (`deobfuscate_assembly`) and external process (`run_de4dot`) modes available in all builds |
 | **Window / Dialog** | List active dialog/message-box windows (Win32 `#32770` + WPF) in the dnSpy process; dismiss them by clicking any button by name (supports EN and ES) |
@@ -485,28 +485,37 @@ Interact with dnSpy's integrated debugger. Most tools require an active debug se
 |------|-------------|-----------------|-----------------|
 | `get_debugger_state` | Current state: `IsDebugging`, `IsRunning`, process list with thread/runtime counts | — | — |
 | `list_breakpoints` | All registered code breakpoints with enabled state, bound count, and location | — | — |
-| `set_breakpoint` | Set a breakpoint at a method entry point or specific IL offset | `assembly_name`, `type_full_name`, `method_name` | `il_offset` |
+| `set_breakpoint` | Set a breakpoint at a method entry point or specific IL offset. Supports an optional C# `condition` expression — only fires when the expression evaluates to `true` | `assembly_name`, `type_full_name`, `method_name` | `il_offset`, `condition`, `file_path` |
 | `remove_breakpoint` | Remove a specific breakpoint | `assembly_name`, `type_full_name`, `method_name` | `il_offset` |
 | `clear_all_breakpoints` | Remove every visible breakpoint | — | — |
 | `continue_debugger` | Resume all paused processes (`RunAll`) | — | — |
 | `break_debugger` | Pause all running processes (`BreakAll`) | — | — |
 | `stop_debugging` | Terminate all active debug sessions | — | — |
 | `get_call_stack` | Call stack of the currently selected (or first paused) thread — up to 50 frames | — | — |
+| `step_over` | Step over the current statement. Blocks until the step completes (or timeout). Returns the new execution location (token, IL offset, module). | — | `thread_id`, `process_id`, `timeout_seconds` |
+| `step_into` | Step into the next called method. Same blocking behaviour as `step_over`. | — | `thread_id`, `process_id`, `timeout_seconds` |
+| `step_out` | Run until the current method returns to its caller. | — | `thread_id`, `process_id`, `timeout_seconds` |
+| `get_current_location` | Read the top-frame execution location without stepping. Requires paused debugger. | — | `thread_id`, `process_id` |
+| `wait_for_pause` | Poll until any process becomes paused (after a `continue_debugger` or `start_debugging`). Returns process info on pause, throws `TimeoutException` otherwise. | — | `timeout_seconds` |
 | `start_debugging` | Launch an EXE under the dnSpy debugger. By default breaks at `EntryPoint` (after the module `.cctor` has run, so ConfuserEx-decrypted bodies are in RAM) | `exe_path` | `arguments`, `working_directory`, `break_kind` |
-| `attach_to_process` | Attach the dnSpy debugger to a running .NET process by PID | `pid` | — |
+| `attach_to_process` | Attach the dnSpy debugger to a running .NET process by PID | `process_id` | — |
 
 #### Parameter details
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `il_offset` | integer | IL byte offset within the method body (default `0` = method entry) |
+| `condition` | string | C# expression evaluated at each breakpoint hit — pauses only when `true` (e.g. `"i > 100"`, `"value != null"`) |
 | `exe_path` | string | Absolute path to the EXE to launch |
 | `arguments` | string | Command-line arguments to pass to the process |
 | `working_directory` | string | Working directory for the launched process |
 | `break_kind` | string | `EntryPoint` (default, pauses after `.cctor`) or `ModuleCctorOrEntryPoint` (pauses before `.cctor`) |
-| `pid` | integer | PID of the running .NET process to attach to |
+| `thread_id` | integer | Explicit thread ID to step/inspect. Defaults to current thread, then first paused thread. |
+| `timeout_seconds` | integer | Max seconds to wait for a step or pause to complete (default `30`) |
 
 > **Tip**: Use `start_debugging` + `break_kind: EntryPoint` for ConfuserEx-packed assemblies — method bodies are decrypted by the time the breakpoint hits. Then use `dump_module_from_memory` or `unpack_from_memory`.
+
+> **Step workflow**: `break_debugger` (or wait for a BP) → `get_current_location` → `step_over` / `step_into` → inspect with `get_local_variables` or `eval_expression` → repeat.
 
 ---
 
@@ -519,7 +528,9 @@ Extract raw bytes from a debugged process. Requires an active debug session unle
 | `list_runtime_modules` | Enumerate all .NET modules loaded in the debugged processes with address, size, `IsDynamic`, `IsInMemory`, and AppDomain | — | `process_id`, `name_filter` |
 | `dump_module_from_memory` | Extract a .NET module from process memory to a file (preserves file layout when possible) | `module_name`, `output_path` | `process_id` |
 | `read_process_memory` | Read up to 64 KB from any process address; returns a formatted hex dump and Base64 | `address`, `size` | `process_id` |
+| `write_process_memory` | Write bytes to a process address (hot-patching). Accepts `bytes_base64` (base64) or `hex_bytes` (e.g. `"90 90 C3"`). Useful for disabling checks without touching the binary on disk. | `address`, (`bytes_base64` or `hex_bytes`) | `process_id` |
 | `get_local_variables` | Read local variables and parameters from a paused stack frame; returns primitives, strings, and addresses for complex objects | — | `frame_index`, `process_id` |
+| `eval_expression` | Evaluate a C# expression in the current paused frame context (Watch window equivalent). Returns typed value: primitive, string, or object address | `expression` | `frame_index`, `process_id`, `func_eval_timeout_seconds` |
 | `get_pe_sections` | List PE section headers of a module in process memory (names, virtual addresses, sizes, characteristics) | `module_name` | `process_id` |
 | `dump_pe_section` | Extract a specific PE section (e.g. `.text`, `.data`, `.rsrc`) from a module in process memory; writes to file and/or returns Base64 | `module_name`, `section_name` | `output_path`, `process_id` |
 | `dump_module_unpacked` | Dump a full module with memory-to-file layout conversion (produces a valid loadable PE). Handles .NET, native, and mixed-mode modules | `module_name`, `output_path` | `process_id` |
@@ -535,7 +546,11 @@ Extract raw bytes from a debugged process. Requires an active debug session unle
 | `output_path` | string | Absolute path where the dumped bytes will be written. Parent directories are created automatically. |
 | `address` | string | Memory address in hex (`0x7FF000`) or decimal |
 | `size` | integer | Number of bytes to read/dump |
+| `bytes_base64` | string | Bytes to write as base64 (use with `write_process_memory`) |
+| `hex_bytes` | string | Bytes to write as hex string — `"90 90 C3"`, `"9090C3"`, `"0x90 0x90"` all accepted |
 | `frame_index` | integer | Stack frame index (0 = top/innermost, default `0`) |
+| `expression` | string | C# expression to evaluate in the current frame context (e.g. `"myObj.Field"`, `"arr.Length"`) |
+| `func_eval_timeout_seconds` | integer | Timeout for function evaluation calls in the debuggee (default `5`) |
 | `section_name` | string | PE section name (e.g. `.text`, `.data`, `.rsrc`) |
 
 > **Layout note**: `dump_module_from_memory` reports `IsFileLayout` in its response. If `false`, use `dump_module_unpacked` instead for a corrected PE layout.

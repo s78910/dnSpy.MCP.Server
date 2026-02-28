@@ -22,6 +22,7 @@ using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.Linq;
 using System.Text.Json;
+using System.Threading;
 using dnlib.DotNet;
 using dnSpy.Contracts.Debugger;
 using dnSpy.Contracts.Debugger.Attach;
@@ -29,6 +30,7 @@ using dnSpy.Contracts.Debugger.Breakpoints.Code;
 using dnSpy.Contracts.Debugger.CallStack;
 using dnSpy.Contracts.Debugger.DotNet.Breakpoints.Code;
 using dnSpy.Contracts.Debugger.DotNet.CorDebug;
+using dnSpy.Contracts.Debugger.Steppers;
 using dnSpy.Contracts.Documents.TreeView;
 using dnSpy.Contracts.Metadata;
 using dnSpy.MCP.Server.Contracts;
@@ -177,6 +179,11 @@ namespace dnSpy.MCP.Server.Application {
 			var moduleId = ModuleId.CreateFromFile(module);
 			var token = method.MDToken.Raw;
 
+			// Optional condition expression
+			string? conditionExpr = null;
+			if (arguments.TryGetValue("condition", out var condObj) && !string.IsNullOrWhiteSpace(condObj?.ToString()))
+				conditionExpr = condObj.ToString()!.Trim();
+
 			try {
 				var bp = breakpointFactory.Value.Create(moduleId, token, ilOffset);
 				if (bp == null) {
@@ -185,14 +192,22 @@ namespace dnSpy.MCP.Server.Application {
 					};
 				}
 
+				// Apply condition if provided
+				if (conditionExpr != null)
+					bp.Condition = new DbgCodeBreakpointCondition(DbgCodeBreakpointConditionKind.IsTrue, conditionExpr);
+
 				var result = JsonSerializer.Serialize(new {
-					Success = true,
-					Method = method.FullName,
-					ILOffset = ilOffset,
-					Token = $"0x{token:X8}",
+					Success    = true,
+					Method     = method.FullName,
+					ILOffset   = ilOffset,
+					Token      = $"0x{token:X8}",
 					ModulePath = module.Location,
-					IsEnabled = bp.IsEnabled
-				}, new JsonSerializerOptions { WriteIndented = true });
+					IsEnabled  = bp.IsEnabled,
+					Condition  = conditionExpr
+				}, new JsonSerializerOptions {
+					WriteIndented = true,
+					DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+				});
 
 				return new CallToolResult {
 					Content = new List<ToolContent> { new ToolContent { Text = result } }
@@ -496,7 +511,189 @@ namespace dnSpy.MCP.Server.Application {
 
 		// ── Helpers ─────────────────────────────────────────────────────────────
 
-		AssemblyDef? FindAssemblyByName(string name, string? filePath = null) {
+	// ── Stepping ─────────────────────────────────────────────────────────────
+
+	/// <summary>
+	/// Steps over the current statement.
+	/// Arguments: thread_id (optional), process_id (optional), timeout_seconds (optional, default 30)
+	/// </summary>
+	public CallToolResult StepOver(Dictionary<string, object>? arguments) =>
+		StepImpl(arguments, DbgStepKind.StepOver);
+
+	/// <summary>
+	/// Steps into the current statement (enters called methods).
+	/// Arguments: thread_id (optional), process_id (optional), timeout_seconds (optional, default 30)
+	/// </summary>
+	public CallToolResult StepInto(Dictionary<string, object>? arguments) =>
+		StepImpl(arguments, DbgStepKind.StepInto);
+
+	/// <summary>
+	/// Steps out of the current method (runs until caller resumes).
+	/// Arguments: thread_id (optional), process_id (optional), timeout_seconds (optional, default 30)
+	/// </summary>
+	public CallToolResult StepOut(Dictionary<string, object>? arguments) =>
+		StepImpl(arguments, DbgStepKind.StepOut);
+
+	/// <summary>
+	/// Returns the current execution location (top frame of current/first paused thread).
+	/// Arguments: thread_id (optional), process_id (optional)
+	/// </summary>
+	public CallToolResult GetCurrentLocation(Dictionary<string, object>? arguments) {
+		var mgr = dbgManager.Value;
+		if (!mgr.IsDebugging)
+			throw new InvalidOperationException("No active debug session.");
+
+		var thread = ResolveThread(mgr, arguments);
+		if (thread == null)
+			throw new InvalidOperationException(
+				"No paused thread found. Use break_debugger or wait for a breakpoint.");
+
+		return System.Windows.Application.Current.Dispatcher.Invoke(() => {
+			var frames = thread.GetFrames(1);
+			if (frames.Length == 0)
+				return new CallToolResult { Content = new List<ToolContent> {
+					new ToolContent { Text = "Thread has no stack frames." } } };
+			var f = frames[0];
+			var json = JsonSerializer.Serialize(new {
+				ThreadId        = (int)thread.Id,
+				FunctionToken   = $"0x{f.FunctionToken:X8}",
+				FunctionOffset  = f.FunctionOffset,
+				ModuleName      = f.Module?.Name ?? "?",
+				IsNextStatement = (f.Flags & DbgStackFrameFlags.LocationIsNextStatement) != 0
+			}, new JsonSerializerOptions { WriteIndented = true });
+			f.Close();
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = json } }
+			};
+		});
+	}
+
+	/// <summary>
+	/// Polls until any process becomes paused, then returns info about it.
+	/// Arguments: timeout_seconds (optional, default 30)
+	/// </summary>
+	public CallToolResult WaitForPause(Dictionary<string, object>? arguments) {
+		var mgr = dbgManager.Value;
+		if (!mgr.IsDebugging)
+			throw new InvalidOperationException("No active debug session.");
+
+		int timeoutSeconds = 30;
+		if (arguments != null && arguments.TryGetValue("timeout_seconds", out var tso)) {
+			if (tso is JsonElement je && je.TryGetInt32(out var ti)) timeoutSeconds = Math.Max(1, ti);
+			else if (int.TryParse(tso?.ToString(), out var ti2)) timeoutSeconds = Math.Max(1, ti2);
+		}
+
+		var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+		while (DateTime.UtcNow < deadline) {
+			var paused = mgr.Processes.FirstOrDefault(p => p.State == DbgProcessState.Paused);
+			if (paused != null) {
+				var json = JsonSerializer.Serialize(new {
+					Paused      = true,
+					ProcessId   = (int)paused.Id,
+					ThreadCount = paused.Threads.Length
+				}, new JsonSerializerOptions { WriteIndented = true });
+				return new CallToolResult {
+					Content = new List<ToolContent> { new ToolContent { Text = json } }
+				};
+			}
+			Thread.Sleep(100);
+		}
+		throw new TimeoutException($"Debugger did not pause within {timeoutSeconds}s.");
+	}
+
+	// ── Private stepping helpers ──────────────────────────────────────────────
+
+	DbgThread? ResolveThread(DbgManager mgr, Dictionary<string, object>? args) {
+		// 1. Explicit thread_id
+		if (args != null && args.TryGetValue("thread_id", out var tidObj)) {
+			if (uint.TryParse(tidObj?.ToString(), out var tidVal))
+				foreach (var p in mgr.Processes)
+					foreach (var t in p.Threads)
+						if (t.Id == tidVal) return t;
+			throw new ArgumentException($"Thread {tidObj} not found");
+		}
+		// 2. Optional process_id filter
+		DbgProcess? targetProc = null;
+		if (args != null && args.TryGetValue("process_id", out var pidObj)) {
+			if (uint.TryParse(pidObj?.ToString(), out var pidVal))
+				targetProc = mgr.Processes.FirstOrDefault(p => p.Id == pidVal);
+			if (targetProc == null) throw new ArgumentException($"Process {pidObj} not found");
+		}
+		// 3. Current thread (honors process_id if set)
+		var cur = mgr.CurrentThread?.Current;
+		if (cur != null && (targetProc == null || cur.Process == targetProc)) return cur;
+		// 4. First paused thread in target/any process
+		var procs = targetProc != null ? new[] { targetProc } : mgr.Processes.ToArray();
+		return procs.Where(p => p.State == DbgProcessState.Paused)
+		            .SelectMany(p => p.Threads).FirstOrDefault();
+	}
+
+	CallToolResult StepImpl(Dictionary<string, object>? arguments, DbgStepKind stepKind) {
+		var mgr = dbgManager.Value;
+		if (!mgr.IsDebugging)
+			throw new InvalidOperationException(
+				"No active debug session. Use start_debugging or attach_to_process first.");
+
+		var thread = ResolveThread(mgr, arguments);
+		if (thread == null)
+			throw new InvalidOperationException(
+				"No paused thread found. Use break_debugger or wait for a breakpoint to hit.");
+
+		int timeoutSeconds = 30;
+		if (arguments != null && arguments.TryGetValue("timeout_seconds", out var tso)) {
+			if (tso is JsonElement je && je.TryGetInt32(out var ti)) timeoutSeconds = Math.Max(1, ti);
+			else if (int.TryParse(tso?.ToString(), out var ti2)) timeoutSeconds = Math.Max(1, ti2);
+		}
+
+		var mre = new ManualResetEventSlim(false);
+		string? stepError = null;
+		object? frameInfo = null;
+
+		System.Windows.Application.Current.Dispatcher.Invoke(() => {
+			var stepper = thread.CreateStepper();
+			if (!stepper.CanStep) {
+				stepper.Close();
+				throw new InvalidOperationException(
+					"Cannot step: process is not paused or stepper is not ready (CanStep=false).");
+			}
+			stepper.StepComplete += (s, e) => {
+				stepError = e.Error;
+				var frames = e.Thread.GetFrames(1);
+				if (frames.Length > 0) {
+					frameInfo = new {
+						ThreadId        = (int)e.Thread.Id,
+						FunctionToken   = $"0x{frames[0].FunctionToken:X8}",
+						FunctionOffset  = frames[0].FunctionOffset,
+						ModuleName      = frames[0].Module?.Name ?? "?",
+						IsNextStatement = (frames[0].Flags & DbgStackFrameFlags.LocationIsNextStatement) != 0
+					};
+					frames[0].Close();
+				}
+				mre.Set();
+			};
+			stepper.Step(stepKind, autoClose: true);
+		});
+
+		if (!mre.Wait(TimeSpan.FromSeconds(timeoutSeconds)))
+			throw new TimeoutException($"Step did not complete within {timeoutSeconds}s.");
+
+		if (stepError != null)
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent {
+					Text = $"Step completed with error: {stepError}" } },
+				IsError = true
+			};
+
+		var json = JsonSerializer.Serialize(new {
+			StepKind = stepKind.ToString(),
+			Location = frameInfo
+		}, new JsonSerializerOptions { WriteIndented = true });
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = json } }
+		};
+	}
+
+	AssemblyDef? FindAssemblyByName(string name, string? filePath = null) {
 			if (!string.IsNullOrEmpty(filePath)) {
 				var normalized = filePath!.Replace('/', '\\');
 				var byPath = documentTreeView.GetAllModuleNodes()
